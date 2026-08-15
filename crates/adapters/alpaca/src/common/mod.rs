@@ -20,4 +20,5 @@ pub mod credential;
 pub mod enums;
 pub mod instrument_info;
 pub mod reg_nms;
+pub mod session;
 pub mod urls;

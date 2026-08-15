@@ -45,8 +45,8 @@ use crate::{
     },
     http::{
         error::{Error, Result},
-        models::{Account, Asset, Clock},
-        query::ListAssetsParams,
+        models::{Account, AlpacaBar, Asset, BarsResponse, CalendarDay, Clock},
+        query::{BarsParams, CalendarParams, ListAssetsParams},
     },
 };
 
@@ -361,22 +361,75 @@ impl AlpacaRawHttpClient {
             .await
     }
 
-    /// Requests historical bars for a symbol.
+    /// Requests the venue trading calendar.
+    ///
+    /// Only days the market opens are returned; weekends and holidays are absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn get_calendar(&self, params: &CalendarParams) -> Result<Vec<CalendarDay>> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/calendar");
+        let query = Self::encode_query(params)?;
+        self.send_request(Method::GET, ApiTarget::Trading, &path, query, None)
+            .await
+    }
+
+    /// Requests one page of bars.
+    ///
+    /// Bars are keyed by symbol, and `next_page_token` is set when more data is available. Use
+    /// [`Self::get_bars_all_pages`] to follow the cursor.
     ///
     /// # Errors
     ///
     /// Returns an error if credentials are missing, the parameters cannot be encoded, or the
     /// request fails.
-    pub async fn get_stock_bars<P: Serialize>(
-        &self,
-        symbol: &str,
-        params: &P,
-    ) -> Result<serde_json::Value> {
+    pub async fn get_bars(&self, params: &BarsParams) -> Result<BarsResponse> {
         self.require_credentials()?;
-        let path = format!("{REST_DATA_STOCKS_PATH}/{symbol}/bars");
+        let path = format!("{REST_DATA_STOCKS_PATH}/bars");
         let query = Self::encode_query(params)?;
         self.send_request(Method::GET, ApiTarget::Data, &path, query, None)
             .await
+    }
+
+    /// Requests bars, following the pagination cursor until the window is exhausted.
+    ///
+    /// `max_pages` bounds the walk so a cursor that fails to advance cannot loop forever. When the
+    /// bound is reached the bars gathered so far are returned and the shortfall is logged, because
+    /// silently returning a truncated series would read as a complete one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any page request fails.
+    pub async fn get_bars_all_pages(
+        &self,
+        params: &BarsParams,
+        max_pages: usize,
+    ) -> Result<HashMap<String, Vec<AlpacaBar>>> {
+        let mut merged: HashMap<String, Vec<AlpacaBar>> = HashMap::new();
+        let mut page_params = params.clone();
+
+        for page in 0..max_pages {
+            let response = self.get_bars(&page_params).await?;
+            for (symbol, bars) in response.bars {
+                merged.entry(symbol).or_default().extend(bars);
+            }
+
+            match response.next_page_token {
+                Some(token) => page_params = page_params.clone().with_page_token(token),
+                None => return Ok(merged),
+            }
+
+            if page + 1 == max_pages {
+                log::warn!(
+                    "Alpaca bars pagination stopped at the {max_pages}-page limit for '{}'; the result is truncated",
+                    params.symbols
+                );
+            }
+        }
+
+        Ok(merged)
     }
 }
 

@@ -62,7 +62,28 @@ pub struct AlpacaDataClientConfig {
     /// Interval for refreshing instruments in minutes.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
+    /// Seconds between market data polls.
+    ///
+    /// The venue's smallest bar is one minute, so polling faster than that only reduces the delay
+    /// before a closed bar is seen; it cannot produce finer data.
+    #[builder(default = 15)]
+    pub poll_interval_secs: u64,
+    /// Minutes of history requested on each poll.
+    ///
+    /// Each poll asks for a rolling window rather than only the newest bar, so a poll that fails
+    /// or arrives late is recovered by the next one instead of leaving a permanent gap. Bars
+    /// already emitted are filtered out by timestamp.
+    #[builder(default = 5)]
+    pub poll_window_mins: u64,
+    /// Days of trading calendar loaded on connect.
+    ///
+    /// The calendar drives session detection and the SIP/overnight feed switch, and it is the only
+    /// source of holidays.
+    #[builder(default = 14)]
+    pub calendar_lookahead_days: u32,
     /// WebSocket transport backend (defaults to `Tungstenite`).
+    ///
+    /// Unused while market data is polled over REST; retained for the WebSocket transport.
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
@@ -76,6 +97,9 @@ nautilus_core::impl_pyo3_config_getters!(AlpacaDataClientConfig {
     http_timeout_secs: u64,
     ws_timeout_secs: u64,
     update_instruments_interval_mins: u64,
+    poll_interval_secs: u64,
+    poll_window_mins: u64,
+    calendar_lookahead_days: u32,
     transport_backend: TransportBackend,
 });
 

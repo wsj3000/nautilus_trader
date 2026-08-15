@@ -23,6 +23,7 @@ crate-type = ["rlib"]
 [features]
 default = ["high-precision"]
 extension-module = [
+  "nautilus-common/extension-module",
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
   "nautilus-network/extension-module",
@@ -31,6 +32,7 @@ extension-module = [
 ]
 python = [
   "dep:nautilus-system",
+  "nautilus-common/python",
   "nautilus-core/python",
   "nautilus-model/python",
   "nautilus-network/python",
@@ -51,13 +53,18 @@ features = ["high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
 nautilus-system = { workspace = true, optional = true }
 
+ahash = { workspace = true }
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
 bon = { workspace = true }
+jiff = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
@@ -66,6 +73,7 @@ serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tokio-util = { workspace = true }
 ustr = { workspace = true }
 zeroize = { workspace = true }

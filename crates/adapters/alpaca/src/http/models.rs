@@ -34,6 +34,77 @@ pub struct Clock {
     pub next_close: String,
 }
 
+/// A trading day from the venue calendar (`GET /v2/calendar`).
+///
+/// The venue sends two different time formats in the same object: `open` and `close` are
+/// `"HH:MM"` while `session_open` and `session_close` are `"HHMM"`. Parsing one with the other's
+/// format fails silently, so both are kept as raw strings here and normalised in
+/// [`crate::common::session`].
+///
+/// Only days the market is open appear; weekends and holidays are absent rather than flagged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarDay {
+    /// Trading date as `YYYY-MM-DD`.
+    pub date: String,
+    /// Regular session open in US Eastern time, formatted `HH:MM`.
+    pub open: String,
+    /// Regular session close in US Eastern time, formatted `HH:MM`.
+    pub close: String,
+    /// Extended session open in US Eastern time, formatted `HHMM`.
+    #[serde(default)]
+    pub session_open: Option<String>,
+    /// Extended session close in US Eastern time, formatted `HHMM`.
+    #[serde(default)]
+    pub session_close: Option<String>,
+    /// Settlement date as `YYYY-MM-DD`.
+    #[serde(default)]
+    pub settlement_date: Option<String>,
+}
+
+/// A single OHLCV bar (`GET /v2/stocks/bars`).
+///
+/// Field names are the venue's one-letter keys. Prices carry up to four decimal places: bars are
+/// built from executions, and Rule 612 constrains quoting rather than trading, so sub-penny prints
+/// appear routinely.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlpacaBar {
+    /// Bar open timestamp (RFC 3339, UTC).
+    pub t: String,
+    /// Open price.
+    pub o: f64,
+    /// High price.
+    pub h: f64,
+    /// Low price.
+    pub l: f64,
+    /// Close price.
+    pub c: f64,
+    /// Volume.
+    pub v: f64,
+    /// Number of trades in the bar.
+    #[serde(default)]
+    pub n: Option<u64>,
+    /// Volume-weighted average price.
+    ///
+    /// Carries more precision than the OHLC fields (six decimals observed) and has no counterpart
+    /// on the Nautilus `Bar`, so it is not converted.
+    #[serde(default)]
+    pub vw: Option<f64>,
+}
+
+/// Response envelope for `GET /v2/stocks/bars`.
+///
+/// Bars are keyed by symbol even for a single-symbol request, and `next_page_token` is present
+/// whenever more data is available.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BarsResponse {
+    /// Bars keyed by symbol.
+    #[serde(default)]
+    pub bars: std::collections::HashMap<String, Vec<AlpacaBar>>,
+    /// Cursor for the next page, when more data is available.
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+}
+
 /// Asset attribute marking eligibility for the Blue Ocean ATS overnight session.
 pub const ATTR_OVERNIGHT_TRADABLE: &str = "overnight_tradable";
 /// Asset attribute marking the asset as halted for the overnight session.
