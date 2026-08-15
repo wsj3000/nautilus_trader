@@ -1,0 +1,102 @@
+[
+  {
+    "id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "class": "us_equity",
+    "exchange": "NASDAQ",
+    "symbol": "AAPL",
+    "name": "Apple Inc. Common Stock",
+    "status": "active",
+    "tradable": true,
+    "marginable": true,
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "shortable": true,
+    "easy_to_borrow": true,
+    "borrow_status": "easy_to_borrow",
+    "fractionable": true,
+    "attributes": [
+      "fractional_eh_enabled",
+      "has_options",
+      "overnight_tradable"
+    ]
+  },
+  {
+    "id": "3f1f0155-1c04-446a-a606-459b16b4d040",
+    "class": "us_equity",
+    "exchange": "NASDAQ",
+    "symbol": "MAMO",
+    "name": "Massimo Group Common Stock",
+    "status": "active",
+    "tradable": false,
+    "marginable": false,
+    "maintenance_margin_requirement": 100,
+    "margin_requirement_long": "100",
+    "margin_requirement_short": "100",
+    "shortable": false,
+    "easy_to_borrow": false,
+    "borrow_status": "hard_to_borrow",
+    "fractionable": false,
+    "attributes": [
+      "overnight_halted"
+    ]
+  },
+  {
+    "id": "cd953482-4c28-4716-b56c-d18610422579",
+    "class": "us_equity",
+    "exchange": "OTC",
+    "symbol": "IVCWF",
+    "name": "Investcorp Europe Acquisition Corp I Warrant",
+    "status": "active",
+    "tradable": false,
+    "marginable": false,
+    "maintenance_margin_requirement": 100,
+    "margin_requirement_long": "100",
+    "margin_requirement_short": "100",
+    "shortable": false,
+    "easy_to_borrow": false,
+    "borrow_status": "hard_to_borrow",
+    "fractionable": false,
+    "attributes": []
+  },
+  {
+    "id": "6b9a9239-f132-42e7-ba22-edac0fba39d4",
+    "class": "us_equity",
+    "exchange": "NASDAQ",
+    "symbol": "MMLP",
+    "name": "Martin Midstream Partners L.P. Limited Partnership",
+    "status": "active",
+    "tradable": true,
+    "marginable": true,
+    "maintenance_margin_requirement": 30,
+    "margin_requirement_long": "30",
+    "margin_requirement_short": "30",
+    "shortable": true,
+    "easy_to_borrow": true,
+    "borrow_status": "easy_to_borrow",
+    "fractionable": false,
+    "attributes": [
+      "ptp_no_exception",
+      "has_options",
+      "overnight_halted"
+    ]
+  },
+  {
+    "id": "fac2eca2-12e2-41a3-9e15-9bf3300bd2bb",
+    "class": "us_equity",
+    "exchange": "NYSE",
+    "symbol": "HYB",
+    "name": "New America High Income Fund, Inc.",
+    "status": "active",
+    "tradable": false,
+    "marginable": false,
+    "maintenance_margin_requirement": 100,
+    "margin_requirement_long": "100",
+    "margin_requirement_short": "100",
+    "shortable": false,
+    "easy_to_borrow": false,
+    "borrow_status": "hard_to_borrow",
+    "fractionable": false,
+    "attributes": []
+  }
+]
