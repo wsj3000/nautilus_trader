@@ -1,0 +1,42 @@
+[
+  {
+    "asset_id": "00000000-0000-4000-8000-0000000000aa",
+    "symbol": "AAPL",
+    "exchange": "NASDAQ",
+    "asset_class": "us_equity",
+    "asset_marginable": true,
+    "qty": "4",
+    "qty_available": "3",
+    "avg_entry_price": "200.125",
+    "side": "long",
+    "market_value": "900.64",
+    "cost_basis": "800.50",
+    "unrealized_pl": "100.14",
+    "unrealized_plpc": "0.1251",
+    "unrealized_intraday_pl": "0",
+    "unrealized_intraday_plpc": "0",
+    "current_price": "225.16",
+    "lastday_price": "225.16",
+    "change_today": "0"
+  },
+  {
+    "asset_id": "00000000-0000-4000-8000-0000000000bb",
+    "symbol": "MSFT",
+    "exchange": "NASDAQ",
+    "asset_class": "us_equity",
+    "asset_marginable": true,
+    "qty": "-2",
+    "qty_available": "-2",
+    "avg_entry_price": "500.00",
+    "side": "short",
+    "market_value": "-1000.00",
+    "cost_basis": "-1000.00",
+    "unrealized_pl": "0",
+    "unrealized_plpc": "0",
+    "unrealized_intraday_pl": "0",
+    "unrealized_intraday_plpc": "0",
+    "current_price": "500.00",
+    "lastday_price": "500.00",
+    "change_today": "0"
+  }
+]

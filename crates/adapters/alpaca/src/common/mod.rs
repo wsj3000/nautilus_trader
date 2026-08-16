@@ -19,6 +19,7 @@ pub mod consts;
 pub mod credential;
 pub mod enums;
 pub mod instrument_info;
+pub mod order_enums;
 pub mod reg_nms;
 pub mod session;
 pub mod urls;

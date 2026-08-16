@@ -20,7 +20,10 @@
 
 use serde::Serialize;
 
-use crate::common::enums::AlpacaDataFeed;
+use crate::common::{
+    enums::AlpacaDataFeed,
+    order_enums::{AlpacaOrderSide, AlpacaOrderType, AlpacaTimeInForce},
+};
 
 /// Query parameters for `GET /v2/assets`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -46,6 +49,102 @@ impl ListAssetsParams {
         Self {
             status: Some("active".to_string()),
             asset_class: Some("us_equity".to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Request body for `POST /v2/orders`.
+///
+/// Quantities and prices are carried as strings so an exact decimal reaches the venue; formatting
+/// them through a float could shift the last digit of a price the caller specified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubmitOrderRequest {
+    /// Ticker symbol.
+    pub symbol: String,
+    /// Quantity in whole shares.
+    pub qty: String,
+    /// Order side.
+    pub side: AlpacaOrderSide,
+    /// Order type.
+    #[serde(rename = "type")]
+    pub order_type: AlpacaOrderType,
+    /// Time in force.
+    pub time_in_force: AlpacaTimeInForce,
+    /// Client-assigned order identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
+    /// Limit price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_price: Option<String>,
+    /// Stop price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_price: Option<String>,
+    /// Whether the order may execute outside the regular session.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub extended_hours: bool,
+}
+
+/// Request body for `PATCH /v2/orders/{id}`.
+///
+/// The venue treats an amendment as a replacement: it answers with a new order carrying a new
+/// identifier, and moves the original to `replaced`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReplaceOrderRequest {
+    /// New quantity in whole shares.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qty: Option<String>,
+    /// New time in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_in_force: Option<AlpacaTimeInForce>,
+    /// New limit price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_price: Option<String>,
+    /// New stop price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_price: Option<String>,
+    /// Client-assigned identifier for the replacement order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
+}
+
+impl ReplaceOrderRequest {
+    /// Returns true when the request would change nothing.
+    ///
+    /// Sending an empty amendment would still replace the order and issue a new identifier, so it
+    /// is worth detecting rather than dispatching.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.qty.is_none()
+            && self.time_in_force.is_none()
+            && self.limit_price.is_none()
+            && self.stop_price.is_none()
+    }
+}
+
+/// Query parameters for `GET /v2/orders`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ListOrdersParams {
+    /// Status filter: `open`, `closed`, or `all`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Maximum orders returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Comma-separated symbol filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbols: Option<String>,
+    /// Whether to include the legs of multi-leg orders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested: Option<bool>,
+}
+
+impl ListOrdersParams {
+    /// Returns parameters selecting all working orders.
+    #[must_use]
+    pub fn open() -> Self {
+        Self {
+            status: Some("open".to_string()),
             ..Self::default()
         }
     }

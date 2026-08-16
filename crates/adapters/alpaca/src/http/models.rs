@@ -21,6 +21,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::order_enums::{
+    AlpacaOrderSide, AlpacaOrderStatus, AlpacaOrderType, AlpacaTimeInForce,
+};
+
 /// Market clock and session state (`GET /v2/clock`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Clock {
@@ -32,6 +36,185 @@ pub struct Clock {
     pub next_open: String,
     /// Next regular session close (RFC 3339).
     pub next_close: String,
+}
+
+/// An order as reported by the venue (`GET /v2/orders`).
+///
+/// Quantities and prices stay as strings exactly as sent. Parsing them into `Decimal` or the
+/// Nautilus value types happens at the conversion boundary so nothing is lost to an intermediate
+/// float.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlpacaOrder {
+    /// Venue order identifier.
+    pub id: String,
+    /// Client-assigned order identifier.
+    pub client_order_id: String,
+    /// Ticker symbol.
+    pub symbol: String,
+    /// Asset class, e.g. `us_equity`.
+    #[serde(default)]
+    pub asset_class: Option<String>,
+    /// Order type, from the `order_type` field.
+    ///
+    /// The venue sends the order type twice, once here and once as `type`. Both are modelled
+    /// separately because a serde alias would reject the payload as a duplicate field; read them
+    /// through [`AlpacaOrder::resolved_order_type`] rather than directly.
+    #[serde(default)]
+    pub order_type: Option<AlpacaOrderType>,
+    /// Order type, from the `type` field. See [`AlpacaOrder::order_type`].
+    #[serde(rename = "type", default)]
+    pub type_alias: Option<AlpacaOrderType>,
+    /// Order side.
+    pub side: AlpacaOrderSide,
+    /// Time in force.
+    pub time_in_force: AlpacaTimeInForce,
+    /// Order status.
+    pub status: AlpacaOrderStatus,
+    /// Ordered quantity, in shares.
+    #[serde(default)]
+    pub qty: Option<String>,
+    /// Filled quantity, in shares.
+    #[serde(default)]
+    pub filled_qty: Option<String>,
+    /// Average fill price.
+    #[serde(default)]
+    pub filled_avg_price: Option<String>,
+    /// Limit price.
+    #[serde(default)]
+    pub limit_price: Option<String>,
+    /// Stop price.
+    #[serde(default)]
+    pub stop_price: Option<String>,
+    /// Notional order amount.
+    ///
+    /// This adapter never sets it: orders are placed in whole shares.
+    #[serde(default)]
+    pub notional: Option<String>,
+    /// Whether the order may execute outside the regular session.
+    #[serde(default)]
+    pub extended_hours: bool,
+    /// Order class, e.g. `simple`, `bracket`. Simple orders carry an empty string, not null.
+    #[serde(default)]
+    pub order_class: Option<String>,
+    /// Identifier of the order this one replaced.
+    #[serde(default)]
+    pub replaces: Option<String>,
+    /// Identifier of the order that replaced this one.
+    #[serde(default)]
+    pub replaced_by: Option<String>,
+    /// When the order was created (RFC 3339).
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// When the order was submitted (RFC 3339).
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+    /// When the order was last updated (RFC 3339).
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// When the order was filled (RFC 3339).
+    #[serde(default)]
+    pub filled_at: Option<String>,
+    /// When the order was canceled (RFC 3339).
+    #[serde(default)]
+    pub canceled_at: Option<String>,
+    /// When the order expired (RFC 3339).
+    ///
+    /// Distinct from `expires_at`, which is the scheduled expiry rather than the event.
+    #[serde(default)]
+    pub expired_at: Option<String>,
+    /// When the order is scheduled to expire (RFC 3339).
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// When the order was replaced (RFC 3339).
+    #[serde(default)]
+    pub replaced_at: Option<String>,
+    /// When the order failed (RFC 3339).
+    #[serde(default)]
+    pub failed_at: Option<String>,
+}
+
+impl AlpacaOrder {
+    /// Returns the order type, reconciling the venue's two copies of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when neither field is present, and when the two disagree. A disagreement
+    /// is a venue-side inconsistency: picking one arbitrarily could submit or report the wrong
+    /// order type, so it is surfaced instead.
+    pub fn resolved_order_type(&self) -> anyhow::Result<AlpacaOrderType> {
+        match (self.order_type, self.type_alias) {
+            (Some(a), Some(b)) if a != b => anyhow::bail!(
+                "Order {} reports conflicting types: order_type={a}, type={b}",
+                self.id
+            ),
+            (Some(value), _) | (None, Some(value)) => Ok(value),
+            (None, None) => anyhow::bail!("Order {} carries no order type", self.id),
+        }
+    }
+
+    /// Returns the timestamp best representing the last activity on the order.
+    #[must_use]
+    pub fn ts_last_raw(&self) -> Option<&str> {
+        self.updated_at
+            .as_deref()
+            .or(self.filled_at.as_deref())
+            .or(self.canceled_at.as_deref())
+            .or(self.submitted_at.as_deref())
+            .or(self.created_at.as_deref())
+    }
+
+    /// Returns the timestamp best representing venue acceptance.
+    #[must_use]
+    pub fn ts_accepted_raw(&self) -> Option<&str> {
+        self.submitted_at.as_deref().or(self.created_at.as_deref())
+    }
+}
+
+/// An open position (`GET /v2/positions`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlpacaPosition {
+    /// Venue-assigned asset identifier.
+    pub asset_id: String,
+    /// Ticker symbol.
+    pub symbol: String,
+    /// Listing exchange.
+    #[serde(default)]
+    pub exchange: Option<String>,
+    /// Asset class.
+    #[serde(default)]
+    pub asset_class: Option<String>,
+    /// Signed position size: negative when short.
+    pub qty: String,
+    /// Quantity not reserved by working orders.
+    #[serde(default)]
+    pub qty_available: Option<String>,
+    /// Average entry price.
+    pub avg_entry_price: String,
+    /// Position direction, `long` or `short`.
+    pub side: String,
+    /// Current market value.
+    #[serde(default)]
+    pub market_value: Option<String>,
+    /// Cost basis.
+    #[serde(default)]
+    pub cost_basis: Option<String>,
+    /// Unrealized profit and loss.
+    #[serde(default)]
+    pub unrealized_pl: Option<String>,
+    /// Latest traded price.
+    #[serde(default)]
+    pub current_price: Option<String>,
+}
+
+impl AlpacaPosition {
+    /// Returns true when the position is short.
+    ///
+    /// The venue reports direction twice, in `side` and in the sign of `qty`; both are consulted
+    /// so a disagreement cannot silently flip a position.
+    #[must_use]
+    pub fn is_short(&self) -> bool {
+        self.side.eq_ignore_ascii_case("short") || self.qty.trim_start().starts_with('-')
+    }
 }
 
 /// A trading day from the venue calendar (`GET /v2/calendar`).

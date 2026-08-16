@@ -45,8 +45,14 @@ use crate::{
     },
     http::{
         error::{Error, Result},
-        models::{Account, AlpacaBar, Asset, BarsResponse, CalendarDay, Clock},
-        query::{BarsParams, CalendarParams, ListAssetsParams},
+        models::{
+            Account, AlpacaBar, AlpacaOrder, AlpacaPosition, Asset, BarsResponse, CalendarDay,
+            Clock,
+        },
+        query::{
+            BarsParams, CalendarParams, ListAssetsParams, ListOrdersParams, ReplaceOrderRequest,
+            SubmitOrderRequest,
+        },
     },
 };
 
@@ -317,6 +323,57 @@ impl AlpacaRawHttpClient {
             .await
     }
 
+    /// Sends a request whose response carries no body.
+    ///
+    /// Retries are gated to `GET` as elsewhere, so this never replays a mutating request.
+    async fn send_request_no_content(
+        &self,
+        method: Method,
+        target: ApiTarget,
+        path: &str,
+        query: Option<String>,
+    ) -> Result<()> {
+        let url = self.build_url(target, path, query);
+        let operation_name = format!("{method} {path}");
+        let keys = vec![target.rate_limit_key().to_string()];
+        let is_idempotent = method == Method::GET;
+
+        let operation = || {
+            let method = method.clone();
+            let url = url.clone();
+            let keys = keys.clone();
+
+            async move {
+                let response = self
+                    .client
+                    .request(method, url, None, None, None, None, Some(keys))
+                    .await
+                    .map_err(|e| Error::from_http_client(&e))?;
+
+                if response.status.is_success() {
+                    Ok(())
+                } else {
+                    Err(Error::from_http_status(
+                        response.status.as_u16(),
+                        &response.body,
+                    ))
+                }
+            }
+        };
+
+        let should_retry = move |err: &Error| is_idempotent && err.is_retryable();
+
+        self.retry_manager
+            .execute_with_retry_with_cancel(
+                &operation_name,
+                operation,
+                should_retry,
+                |e| Error::transport(e.to_string()),
+                &self.cancellation_token,
+            )
+            .await
+    }
+
     fn encode_query<P: Serialize>(params: &P) -> Result<Option<String>> {
         let encoded = serde_urlencoded::to_string(params)
             .map_err(|e| Error::bad_request(format!("Failed to encode query parameters: {e}")))?;
@@ -358,6 +415,107 @@ impl AlpacaRawHttpClient {
         let path = format!("{REST_TRADING_PATH}/assets");
         let query = Self::encode_query(params)?;
         self.send_request(Method::GET, ApiTarget::Trading, &path, query, None)
+            .await
+    }
+
+    /// Lists orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn list_orders(&self, params: &ListOrdersParams) -> Result<Vec<AlpacaOrder>> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/orders");
+        let query = Self::encode_query(params)?;
+        self.send_request(Method::GET, ApiTarget::Trading, &path, query, None)
+            .await
+    }
+
+    /// Requests a single order by venue identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn get_order(&self, venue_order_id: &str) -> Result<AlpacaOrder> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/orders/{venue_order_id}");
+        self.send_request(Method::GET, ApiTarget::Trading, &path, None, None)
+            .await
+    }
+
+    /// Lists open positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn list_positions(&self) -> Result<Vec<AlpacaPosition>> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/positions");
+        self.send_request(Method::GET, ApiTarget::Trading, &path, None, None)
+            .await
+    }
+
+    /// Submits an order.
+    ///
+    /// Not retried: a replayed submission would place a second order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the body cannot be encoded, or the venue
+    /// rejects the order.
+    pub async fn submit_order(&self, request: &SubmitOrderRequest) -> Result<AlpacaOrder> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/orders");
+        let body = serde_json::to_vec(request)?;
+        self.send_request(Method::POST, ApiTarget::Trading, &path, None, Some(body))
+            .await
+    }
+
+    /// Replaces an order.
+    ///
+    /// The venue answers with a **new** order carrying a new identifier and moves the original to
+    /// `replaced`. Callers must follow that identifier or they will track an order that no longer
+    /// receives updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the body cannot be encoded, or the venue
+    /// rejects the amendment.
+    pub async fn replace_order(
+        &self,
+        venue_order_id: &str,
+        request: &ReplaceOrderRequest,
+    ) -> Result<AlpacaOrder> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/orders/{venue_order_id}");
+        let body = serde_json::to_vec(request)?;
+        self.send_request(Method::PATCH, ApiTarget::Trading, &path, None, Some(body))
+            .await
+    }
+
+    /// Cancels an order.
+    ///
+    /// The venue answers `204 No Content`, so there is no body to decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn cancel_order(&self, venue_order_id: &str) -> Result<()> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/orders/{venue_order_id}");
+        self.send_request_no_content(Method::DELETE, ApiTarget::Trading, &path, None)
+            .await
+    }
+
+    /// Cancels every open order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn cancel_all_orders(&self) -> Result<()> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/orders");
+        self.send_request_no_content(Method::DELETE, ApiTarget::Trading, &path, None)
             .await
     }
 

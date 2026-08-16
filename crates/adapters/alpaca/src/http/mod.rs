@@ -19,4 +19,5 @@ pub mod client;
 pub mod error;
 pub mod models;
 pub mod parse;
+pub mod parse_exec;
 pub mod query;
