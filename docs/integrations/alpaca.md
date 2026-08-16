@@ -170,10 +170,35 @@ Fill reports record **zero commission** and an **unspecified liquidity side**, b
 reports neither. A fill without an execution identifier is refused: after a reconnect the same
 execution is redelivered, and without that identifier a repeat cannot be told from a new fill.
 
+### Fill recovery
+
+The event stream reports fills as they happen but cannot be replayed, and reconciliation runs
+before it has delivered anything. `generate_fill_reports` therefore reads
+`GET /v2/account/activities?activity_types=FILL`, which returns one record per execution, newest
+first.
+
+Each record's `qty` is that execution's own quantity while `cum_qty` runs to the order total, so a
+partially filled order appears as several records. A fill that opens a short position is reported
+with side `sell_short`, which maps to a Nautilus sell — direction lives in the position there, not
+in the side. Submissions never carry it: an equity order is sent as `sell` and the venue decides
+from the position held. The venue caps a page at 100 and sends no
+`next_page_token`: the cursor is the last record's `id`, and a page shorter than requested ends
+the walk. The command's time window is passed through as `after` and `until`; its instrument and
+order filters are applied locally, because the endpoint accepts neither.
+
+Activity identifiers are 55 characters against the 36 a `TradeId` holds, and take the form
+`<sequence>::<uuid>`. The half after the separator is used: in a sample of live activities it was
+always a 36-character UUID, unique per fill, and the same shape the event stream reports as
+`execution_id`. An identifier with no part short enough is refused rather than truncated, since
+truncation could collide with another execution.
+
+Whether that UUID is the *same value* the stream reports has not been confirmed; it needs one fill
+observed on both paths, which needs an open market. If it matches, a recovered fill and the live
+one de-duplicate to a single trade; if not, one execution would reach the engine as two.
+
 ### Known limitations
 
 - `cancel_all_orders` is account-wide at the venue; the instrument scope on the command cannot be honoured.
-- `generate_fill_reports` returns an error. Fills are published from the event stream as they occur and cannot be requested retrospectively.
 - Bracket and OCO order classes are not implemented.
 - Extended-hours execution is opt-in through `default_extended_hours`.
 

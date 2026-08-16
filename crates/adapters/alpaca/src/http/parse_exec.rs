@@ -26,7 +26,7 @@ use rust_decimal::Decimal;
 
 use crate::{
     http::{
-        models::{AlpacaOrder, AlpacaPosition},
+        models::{AlpacaFillActivity, AlpacaOrder, AlpacaPosition},
         parse::{instrument_id, parse_rfc3339_nanos},
     },
     websocket::messages::TradeUpdate,
@@ -254,6 +254,75 @@ pub fn parse_fill_report(
     ))
 }
 
+/// Extracts the execution identifier from an activity ID.
+///
+/// The venue formats it as `<sequence>::<uuid>`, 55 characters against the 36 a `TradeId` holds.
+/// The half after the separator is taken: across a sample of live activities it was invariably a
+/// 36-character UUID, unique per fill, which is both what fits and the same shape the trading
+/// event stream reports as `execution_id`.
+///
+/// Whether the two are the *same* value has not been confirmed — doing so needs one fill observed
+/// on the stream and again in the activity feed, which needs an open market. If they match, a fill
+/// recovered here and the same fill seen live resolve to one trade identifier; if they do not, the
+/// engine would see two trades for one execution, so it is worth confirming before this path
+/// carries real positions.
+///
+/// # Errors
+///
+/// Returns an error when no part of the identifier fits, rather than truncating: a truncated
+/// identifier could collide with another fill.
+pub fn extract_execution_id(activity_id: &str) -> anyhow::Result<&str> {
+    const MAX_TRADE_ID_LEN: usize = 36;
+
+    let candidate = activity_id.rsplit("::").next().unwrap_or(activity_id);
+
+    if candidate.len() <= MAX_TRADE_ID_LEN {
+        return Ok(candidate);
+    }
+    if activity_id.len() <= MAX_TRADE_ID_LEN {
+        return Ok(activity_id);
+    }
+
+    anyhow::bail!(
+        "Activity ID '{activity_id}' has no part short enough for a trade ID (max \
+         {MAX_TRADE_ID_LEN} characters)"
+    )
+}
+
+/// Converts a fill activity into a Nautilus fill report.
+///
+/// The activity feed is how fills are recovered at startup: the trading event stream reports them
+/// as they happen but cannot be replayed.
+///
+/// # Errors
+///
+/// Returns an error if any value cannot be converted.
+pub fn parse_fill_activity_report(
+    activity: &AlpacaFillActivity,
+    account_id: AccountId,
+    price_precision: u8,
+    ts_init: UnixNanos,
+) -> anyhow::Result<FillReport> {
+    Ok(FillReport::new(
+        account_id,
+        instrument_id(&activity.symbol),
+        VenueOrderId::new(activity.order_id.as_str()),
+        TradeId::new(extract_execution_id(&activity.id)?),
+        activity.side.to_nautilus()?,
+        parse_quantity(activity.cum_qty.as_deref().unwrap_or(&activity.qty), "qty")?,
+        parse_price(&activity.price, "price", price_precision)?,
+        // The venue reports no commission on this feed and US equity trading there is
+        // commission-free; inventing a figure would corrupt realised PnL.
+        Money::new(0.0, Currency::USD()),
+        LiquiditySide::NoLiquiditySide,
+        None, // client_order_id: not carried by the activity
+        None,
+        parse_rfc3339_nanos(&activity.transaction_time)?,
+        ts_init,
+        None,
+    ))
+}
+
 /// Returns true when the report describes an order the engine should still track.
 #[must_use]
 pub fn is_open_status(status: OrderStatus) -> bool {
@@ -274,12 +343,18 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::common::order_enums::AlpacaOrderSide;
 
     const ORDERS_JSON: &str = include_str!("../../test_data/http_orders.json");
     const POSITIONS_JSON: &str = include_str!("../../test_data/http_positions.json");
+    const ACTIVITIES_JSON: &str = include_str!("../../test_data/http_activities_fills.json");
 
     fn orders() -> Vec<AlpacaOrder> {
         serde_json::from_str(ORDERS_JSON).unwrap()
+    }
+
+    fn activities() -> Vec<AlpacaFillActivity> {
+        serde_json::from_str(ACTIVITIES_JSON).unwrap()
     }
 
     fn positions() -> Vec<AlpacaPosition> {
@@ -543,5 +618,155 @@ mod tests {
         let update: TradeUpdate = serde_json::from_str(json).unwrap();
         let err = parse_fill_report(&update, account(), 4, UnixNanos::default()).unwrap_err();
         assert!(err.to_string().contains("no execution detail"), "{err}");
+    }
+
+    fn fill_activity() -> AlpacaFillActivity {
+        // Shaped as the venue returns it from /v2/account/activities, with the identifiers
+        // replaced but their exact lengths and format kept.
+        let json = r#"{
+            "id": "20260624211230709::1444f6ad-0000-4000-8000-000000000001",
+            "activity_type": "FILL",
+            "transaction_time": "2026-06-25T01:12:30.709802Z",
+            "type": "fill",
+            "price": "736.03",
+            "qty": "1",
+            "side": "buy",
+            "symbol": "SPY",
+            "leaves_qty": "0",
+            "order_id": "0000aaaa-0000-4000-8000-000000000001",
+            "cum_qty": "1",
+            "order_status": "filled"
+        }"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[rstest]
+    fn test_parse_fill_activity_report() {
+        let report =
+            parse_fill_activity_report(&fill_activity(), account(), 4, UnixNanos::from(5)).unwrap();
+
+        assert_eq!(report.instrument_id.to_string(), "SPY.ALPACA");
+        assert_eq!(
+            report.venue_order_id,
+            VenueOrderId::new("0000aaaa-0000-4000-8000-000000000001")
+        );
+        assert_eq!(report.last_qty, Quantity::new(1.0, 0));
+        assert_eq!(report.last_px, Price::new(736.03, 4));
+        assert_eq!(report.ts_init, UnixNanos::from(5));
+    }
+
+    #[rstest]
+    fn test_trade_id_is_the_uuid_half_of_the_activity_id() {
+        // The full activity ID is 55 characters and a TradeId holds 36. The UUID half is also
+        // what the trading event stream reports as `execution_id`, so a fill seen live and again
+        // here resolves to one trade identifier.
+        let report =
+            parse_fill_activity_report(&fill_activity(), account(), 4, UnixNanos::default())
+                .unwrap();
+        assert_eq!(
+            report.trade_id,
+            TradeId::new("1444f6ad-0000-4000-8000-000000000001")
+        );
+    }
+
+    #[rstest]
+    #[case(
+        "20260624211230709::1444f6ad-0000-4000-8000-000000000001",
+        "1444f6ad-0000-4000-8000-000000000001"
+    )]
+    #[case(
+        "1444f6ad-0000-4000-8000-000000000001",
+        "1444f6ad-0000-4000-8000-000000000001"
+    )]
+    #[case("short-id", "short-id")]
+    fn test_execution_id_extraction(#[case] activity_id: &str, #[case] expected: &str) {
+        assert_eq!(extract_execution_id(activity_id).unwrap(), expected);
+    }
+
+    #[rstest]
+    fn test_overlong_execution_id_is_refused_not_truncated() {
+        // Truncating could collide with another fill and double-count it.
+        let too_long = "x".repeat(40);
+        assert!(extract_execution_id(&too_long).is_err());
+    }
+
+    #[rstest]
+    fn test_fill_activity_records_zero_commission() {
+        let report =
+            parse_fill_activity_report(&fill_activity(), account(), 4, UnixNanos::default())
+                .unwrap();
+        assert_eq!(report.commission, Money::new(0.0, Currency::USD()));
+    }
+
+    #[rstest]
+    fn test_fill_activity_timestamp_is_the_transaction_time() {
+        let report =
+            parse_fill_activity_report(&fill_activity(), account(), 4, UnixNanos::default())
+                .unwrap();
+        let expected = parse_rfc3339_nanos("2026-06-25T01:12:30.709802Z").unwrap();
+        assert_eq!(report.ts_event, expected);
+    }
+
+    #[rstest]
+    fn test_activities_fixture_parses_every_record() {
+        // Captured from the live account, so the shapes are the venue's own. Every record has to
+        // convert: one that does not is a fill dropped from reconciliation, and a dropped fill is
+        // a position the engine and the venue disagree about.
+        let activities = activities();
+        assert_eq!(activities.len(), 6);
+        for activity in &activities {
+            parse_fill_activity_report(activity, account(), 4, UnixNanos::from(1))
+                .unwrap_or_else(|e| panic!("failed to parse {}: {e}", activity.id));
+        }
+    }
+
+    #[rstest]
+    fn test_short_sale_activity_reports_a_sell() {
+        // The venue reports `sell_short` on the fill that opens a short. It is rare — one record
+        // in several hundred on the account this fixture came from — and refusing it left the
+        // engine flat on an instrument the venue reported short.
+        let activity = activities()
+            .into_iter()
+            .find(|a| a.side == AlpacaOrderSide::SellShort)
+            .expect("fixture has no short sale");
+
+        let report = parse_fill_activity_report(&activity, account(), 4, UnixNanos::from(1))
+            .expect("a short sale must convert");
+        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.last_qty, Quantity::new(1.0, 0));
+    }
+
+    #[rstest]
+    fn test_partial_fills_report_the_execution_quantity_not_the_running_total() {
+        // A partially filled order arrives as several records. Reading `cum_qty` instead of `qty`
+        // would count the earlier executions again on every subsequent one.
+        let partials: Vec<_> = activities()
+            .into_iter()
+            .filter(|a| a.fill_type.as_deref() == Some("partial_fill"))
+            .collect();
+        assert!(partials.len() >= 2);
+
+        for activity in &partials {
+            let report = parse_fill_activity_report(activity, account(), 4, UnixNanos::from(1))
+                .unwrap_or_else(|e| panic!("failed to parse {}: {e}", activity.id));
+            let expected = parse_quantity(&activity.qty, "qty").unwrap();
+            assert_eq!(report.last_qty, expected);
+        }
+
+        // The last record's running total exceeds its own quantity, so the two are distinguishable
+        // and this test would fail if the wrong field were read.
+        let last = partials.last().unwrap();
+        assert_ne!(last.qty, *last.cum_qty.as_ref().unwrap());
+    }
+
+    #[rstest]
+    fn test_activity_trade_ids_are_unique_across_the_fixture() {
+        // Fills de-duplicate on trade identifier, so a collision would silently merge two
+        // executions into one.
+        let ids: std::collections::HashSet<_> = activities()
+            .iter()
+            .map(|a| extract_execution_id(&a.id).unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 6);
     }
 }

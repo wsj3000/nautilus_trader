@@ -74,16 +74,23 @@ use crate::{
         client::AlpacaRawHttpClient,
         models::AlpacaOrder,
         parse_exec::{
-            parse_decimal, parse_fill_report, parse_order_status_report,
-            parse_position_status_report,
+            parse_decimal, parse_fill_activity_report, parse_fill_report,
+            parse_order_status_report, parse_position_status_report,
         },
-        query::{ListOrdersParams, ReplaceOrderRequest, SubmitOrderRequest},
+        query::{ActivitiesParams, ListOrdersParams, ReplaceOrderRequest, SubmitOrderRequest},
     },
     websocket::{
         client::connect_trading_stream,
         messages::{AlpacaTradeEvent, TradeUpdate},
     },
 };
+
+/// Maximum pages walked when following the activities cursor.
+///
+/// The venue caps a page at 100, so this admits 5,000 fills. Reconciliation asks for a bounded
+/// window rather than the whole history, and a busier account than that wants a narrower window
+/// rather than a larger limit here.
+const MAX_ACTIVITY_PAGES: usize = 50;
 
 /// Tracks the venue identifier an order currently trades under.
 ///
@@ -782,15 +789,44 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     async fn generate_fill_reports(
         &self,
-        _cmd: GenerateFillReports,
+        cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        // Fills arrive on the trading event stream and are published as they happen. There is no
-        // REST endpoint this adapter reads to reconstruct them on demand, and returning an empty
-        // set would read as "no fills", so the limitation is stated instead.
-        anyhow::bail!(
-            "Alpaca fills are published from the trading event stream as they occur; they cannot \
-             be requested retrospectively through this client"
-        )
+        // Recovered from the activity feed rather than the trading event stream, which reports
+        // fills as they happen but cannot be replayed. Reconciliation runs at startup, before the
+        // stream has delivered anything, so it needs this path.
+        //
+        // The endpoint returns newest first and accepts a time window, so the request is bounded
+        // where it can be. Symbol and order filters are applied here because it takes neither.
+        let params = ActivitiesParams::fills().with_window(
+            cmd.start.map(|nanos| nanos.to_rfc3339()),
+            cmd.end.map(|nanos| nanos.to_rfc3339()),
+        );
+        let activities = self
+            .http_client
+            .list_fill_activities_all_pages(&params, MAX_ACTIVITY_PAGES)
+            .await?;
+
+        let symbol = cmd.instrument_id.map(|id| id.symbol);
+        let ts_init = self.clock.get_time_ns();
+        Ok(activities
+            .iter()
+            .filter(|activity| {
+                symbol.is_none_or(|symbol| symbol.as_str() == activity.symbol)
+                    && cmd
+                        .venue_order_id
+                        .is_none_or(|id| id.as_str() == activity.order_id)
+            })
+            .filter_map(|activity| {
+                parse_fill_activity_report(
+                    activity,
+                    self.core.account_id,
+                    reg_nms::PRICE_PRECISION,
+                    ts_init,
+                )
+                .inspect_err(|e| log::warn!("Skipping Alpaca fill activity {}: {e}", activity.id))
+                .ok()
+            })
+            .collect())
     }
 
     async fn generate_position_status_reports(

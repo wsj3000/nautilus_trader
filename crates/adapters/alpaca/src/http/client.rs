@@ -46,12 +46,12 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{
-            Account, AlpacaBar, AlpacaOrder, AlpacaPosition, Asset, BarsResponse, CalendarDay,
-            Clock,
+            Account, AlpacaBar, AlpacaFillActivity, AlpacaOrder, AlpacaPosition, Asset,
+            BarsResponse, CalendarDay, Clock,
         },
         query::{
-            BarsParams, CalendarParams, ListAssetsParams, ListOrdersParams, ReplaceOrderRequest,
-            SubmitOrderRequest,
+            ACTIVITIES_MAX_PAGE_SIZE, ActivitiesParams, BarsParams, CalendarParams,
+            ListAssetsParams, ListOrdersParams, ReplaceOrderRequest, SubmitOrderRequest,
         },
     },
 };
@@ -517,6 +517,71 @@ impl AlpacaRawHttpClient {
         let path = format!("{REST_TRADING_PATH}/orders");
         self.send_request_no_content(Method::DELETE, ApiTarget::Trading, &path, None)
             .await
+    }
+
+    /// Requests account activities, such as fills.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn list_fill_activities(
+        &self,
+        params: &ActivitiesParams,
+    ) -> Result<Vec<AlpacaFillActivity>> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/account/activities");
+        let query = Self::encode_query(params)?;
+        self.send_request(Method::GET, ApiTarget::Trading, &path, query, None)
+            .await
+    }
+
+    /// Requests fill activities, following the cursor until the venue runs out.
+    ///
+    /// Activities come back as a bare array rather than in an envelope, so unlike bars there is no
+    /// `next_page_token` to follow. The cursor is the `id` of the last activity on the page, and a
+    /// page shorter than requested means the end. The venue caps a page at
+    /// [`ACTIVITIES_MAX_PAGE_SIZE`], so an account with a long history needs many requests, and
+    /// `max_pages` bounds that.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or any request fails.
+    pub async fn list_fill_activities_all_pages(
+        &self,
+        params: &ActivitiesParams,
+        max_pages: usize,
+    ) -> Result<Vec<AlpacaFillActivity>> {
+        let page_size = params.page_size.unwrap_or(ACTIVITIES_MAX_PAGE_SIZE) as usize;
+        let mut collected: Vec<AlpacaFillActivity> = Vec::new();
+        let mut page_params = params.clone();
+
+        for page in 0..max_pages {
+            let activities = self.list_fill_activities(&page_params).await?;
+            let received = activities.len();
+            let cursor = activities.last().map(|activity| activity.id.clone());
+            collected.extend(activities);
+
+            // A short page is the last one. Requiring a cursor as well stops an empty page from
+            // looping until the limit.
+            if received < page_size {
+                return Ok(collected);
+            }
+
+            match cursor {
+                Some(token) => page_params = page_params.clone().with_page_token(token),
+                None => return Ok(collected),
+            }
+
+            if page + 1 == max_pages {
+                log::warn!(
+                    "Alpaca activities pagination stopped at the {max_pages}-page limit after {} \
+                     records; earlier fills are missing from this result",
+                    collected.len(),
+                );
+            }
+        }
+
+        Ok(collected)
     }
 
     /// Requests the venue trading calendar.

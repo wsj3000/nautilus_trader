@@ -5582,6 +5582,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "axum",
  "bon",
  "futures-util",
  "jiff",

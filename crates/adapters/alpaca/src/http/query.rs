@@ -150,6 +150,58 @@ impl ListOrdersParams {
     }
 }
 
+/// Query parameters for `GET /v2/account/activities`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ActivitiesParams {
+    /// Activity types to return, comma separated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_types: Option<String>,
+    /// Return activities after this timestamp (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Return activities before this timestamp (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    /// Maximum activities returned, capped by the venue at [`ACTIVITIES_MAX_PAGE_SIZE`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    /// Cursor for the next page: the `id` of the last activity on the previous page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_token: Option<String>,
+}
+
+/// The largest page the activities endpoint accepts.
+///
+/// Asking for more is rejected with code 40010001 rather than being silently reduced.
+pub const ACTIVITIES_MAX_PAGE_SIZE: u32 = 100;
+
+impl ActivitiesParams {
+    /// Returns parameters selecting fill activities, a full page at a time.
+    #[must_use]
+    pub fn fills() -> Self {
+        Self {
+            activity_types: Some("FILL".to_string()),
+            page_size: Some(ACTIVITIES_MAX_PAGE_SIZE),
+            ..Self::default()
+        }
+    }
+
+    /// Returns these parameters with the page cursor set.
+    #[must_use]
+    pub fn with_page_token(mut self, token: String) -> Self {
+        self.page_token = Some(token);
+        self
+    }
+
+    /// Returns these parameters bounded by the given RFC 3339 timestamps.
+    #[must_use]
+    pub fn with_window(mut self, after: Option<String>, until: Option<String>) -> Self {
+        self.after = after;
+        self.until = until;
+        self
+    }
+}
+
 /// Query parameters for `GET /v2/calendar`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CalendarParams {

@@ -319,6 +319,35 @@ async fn main() -> anyhow::Result<ExitCode> {
         ));
     }
 
+    // Startup reconciliation reads fills from here. `alpaca-py`'s `TradingClient` does not cover
+    // this endpoint, so watching SDK releases would not surface a change to it either.
+    let live = fetcher
+        .trading("/v2/account/activities?activity_types=FILL&page_size=10")
+        .await?;
+    if live.as_array().is_some_and(|a| a.is_empty()) {
+        println!("note: no fill activities, so /v2/account/activities was not compared\n");
+    } else {
+        findings.extend(compare(
+            "/v2/account/activities",
+            &load_fixture("http_activities_fills.json")?,
+            &live,
+        ));
+        // An unmodelled side drops the fill from reconciliation, and the engine's position parts
+        // company with the venue's without saying so.
+        findings.extend(check_enum_values(
+            "/v2/account/activities",
+            &live,
+            "side",
+            &["buy", "sell", "sell_short"],
+        ));
+        findings.extend(check_enum_values(
+            "/v2/account/activities",
+            &live,
+            "type",
+            &["fill", "partial_fill"],
+        ));
+    }
+
     for (feed, start, end, fixture) in [
         (
             "sip",

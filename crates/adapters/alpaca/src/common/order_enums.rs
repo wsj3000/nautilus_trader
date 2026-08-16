@@ -32,6 +32,11 @@ use strum::{AsRefStr, Display, EnumString};
 pub enum AlpacaOrderSide {
     Buy,
     Sell,
+    /// Reported on a fill that opened a short position.
+    ///
+    /// This appears on the activity feed rather than on submissions: an equity order is sent as
+    /// `sell`, and the venue decides from the position held whether it closes or goes short.
+    SellShort,
     #[serde(other)]
     Unknown,
 }
@@ -45,7 +50,10 @@ impl AlpacaOrderSide {
     pub fn to_nautilus(self) -> anyhow::Result<OrderSide> {
         match self {
             Self::Buy => Ok(OrderSide::Buy),
-            Self::Sell => Ok(OrderSide::Sell),
+            // Nautilus carries direction in the position rather than the side, so a short sale is
+            // a sell. Refusing it instead would drop the fill that opened the short, leaving the
+            // engine's position disagreeing with the venue's.
+            Self::Sell | Self::SellShort => Ok(OrderSide::Sell),
             Self::Unknown => anyhow::bail!("Unrecognised Alpaca order side"),
         }
     }
@@ -273,11 +281,33 @@ mod tests {
     #[rstest]
     #[case("buy", AlpacaOrderSide::Buy)]
     #[case("sell", AlpacaOrderSide::Sell)]
+    #[case("sell_short", AlpacaOrderSide::SellShort)]
     fn test_side_deserializes(#[case] raw: &str, #[case] expected: AlpacaOrderSide) {
         let json = format!("\"{raw}\"");
         assert_eq!(
             serde_json::from_str::<AlpacaOrderSide>(&json).unwrap(),
             expected
+        );
+    }
+
+    #[rstest]
+    fn test_short_sale_converts_to_a_sell() {
+        // The activity feed reports the fill that opens a short as `sell_short`. Nautilus has no
+        // such side, and refusing it would drop that fill from reconciliation, leaving the engine
+        // flat on an instrument the venue reports as short.
+        assert_eq!(
+            AlpacaOrderSide::SellShort.to_nautilus().unwrap(),
+            OrderSide::Sell
+        );
+    }
+
+    #[rstest]
+    fn test_a_nautilus_sell_is_submitted_as_a_plain_sell() {
+        // Submissions never carry `sell_short`: the venue derives it from the position held, and
+        // sending it would be rejected.
+        assert_eq!(
+            AlpacaOrderSide::from_nautilus(OrderSide::Sell).unwrap(),
+            AlpacaOrderSide::Sell
         );
     }
 

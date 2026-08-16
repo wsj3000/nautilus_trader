@@ -170,6 +170,43 @@ impl AlpacaOrder {
     }
 }
 
+/// A fill activity (`GET /v2/account/activities?activity_types=FILL`).
+///
+/// This is how completed fills are recovered on startup. The trading event stream reports fills as
+/// they happen but cannot be replayed, so reconciliation reads them from here instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlpacaFillActivity {
+    /// Activity identifier, unique per fill.
+    pub id: String,
+    /// Always `FILL` for this type.
+    #[serde(default)]
+    pub activity_type: Option<String>,
+    /// `fill` for a complete fill, `partial_fill` otherwise.
+    #[serde(rename = "type", default)]
+    pub fill_type: Option<String>,
+    /// When the fill occurred (RFC 3339).
+    pub transaction_time: String,
+    /// Ticker symbol.
+    pub symbol: String,
+    /// Side of the fill.
+    pub side: AlpacaOrderSide,
+    /// Execution price.
+    pub price: String,
+    /// Executed quantity.
+    pub qty: String,
+    /// Venue order identifier the fill belongs to.
+    pub order_id: String,
+    /// Cumulative filled quantity on the order.
+    #[serde(default)]
+    pub cum_qty: Option<String>,
+    /// Quantity still working on the order.
+    #[serde(default)]
+    pub leaves_qty: Option<String>,
+    /// Order status after the fill.
+    #[serde(default)]
+    pub order_status: Option<String>,
+}
+
 /// An open position (`GET /v2/positions`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlpacaPosition {

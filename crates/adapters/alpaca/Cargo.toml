@@ -58,6 +58,9 @@ ustr = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# Serves the mock venue in tests/http.rs, where paging is about the sequence of requests rather
+# than the shape of any one response, so a stored payload cannot cover it.
+axum = { workspace = true }
 # The conformance example fetches raw JSON, deliberately bypassing the adapter's typed client:
 # comparing a parsed-and-reserialized model against the fixtures could only ever detect drift
 # between the model and the fixture, never between the fixture and the venue.
