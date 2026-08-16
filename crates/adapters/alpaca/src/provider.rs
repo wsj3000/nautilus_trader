@@ -102,16 +102,22 @@ impl AlpacaInstrumentProvider {
             }
 
             match parse_equity(asset, ts_init) {
-                Ok(instrument) => {
-                    self.instruments.insert(instrument.id(), instrument.clone());
-                    loaded.push(instrument);
-                }
+                Ok(instrument) => loaded.push(instrument),
                 Err(e) => {
                     log::warn!("Failed to parse Alpaca asset '{}': {e}", asset.symbol);
                     skipped += 1;
                 }
             }
         }
+
+        // Inserted in one pass. `AtomicMap::insert` clones the whole map per call, so inserting
+        // individually would be quadratic — with the venue's ~13,000 tradable equities that is
+        // tens of millions of instrument clones, and the load never finishes.
+        self.instruments.rcu(|map| {
+            for instrument in &loaded {
+                map.insert(instrument.id(), instrument.clone());
+            }
+        });
 
         log::debug!(
             "Loaded {} Alpaca instruments ({skipped} skipped of {} assets)",
@@ -207,5 +213,27 @@ mod tests {
         let provider = provider();
         assert!(provider.parse_and_cache(&[], UnixNanos::from(1)).is_empty());
         assert_eq!(provider.count(), 0);
+    }
+
+    #[rstest]
+    fn test_bulk_load_inserts_in_one_pass() {
+        // Guards the quadratic insert: `AtomicMap::insert` clones the whole map per call, so a
+        // per-asset insert makes a venue-sized load take tens of millions of clones. This asserts
+        // the batch lands, which only holds if the single-pass path is taken.
+        let provider = provider();
+        let mut assets = Vec::new();
+        for i in 0..500 {
+            let mut asset = sample_assets()
+                .into_iter()
+                .find(|a| a.symbol == "AAPL")
+                .unwrap();
+            asset.symbol = format!("SYM{i}");
+            assets.push(asset);
+        }
+
+        let loaded = provider.parse_and_cache(&assets, UnixNanos::from(1));
+        assert_eq!(loaded.len(), 500);
+        assert_eq!(provider.count(), 500);
+        assert!(provider.get_by_symbol("SYM499").is_some());
     }
 }
