@@ -482,7 +482,22 @@ impl ExecutionClient for AlpacaExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        if self.core.is_started() {
+            return Ok(());
+        }
+
+        // Without this the emitter drops every event it is handed, so account state and order
+        // events never reach the engine.
+        self.emitter
+            .set_sender(nautilus_common::live::runner::get_exec_event_sender());
         self.core.set_started();
+
+        log::info!(
+            "Started: client_id={}, account_id={}, environment={:?}",
+            self.core.client_id,
+            self.core.account_id,
+            self.config.environment,
+        );
         Ok(())
     }
 
