@@ -51,7 +51,8 @@ use crate::{
         },
         query::{
             ACTIVITIES_MAX_PAGE_SIZE, ActivitiesParams, BarsParams, CalendarParams,
-            ListAssetsParams, ListOrdersParams, ReplaceOrderRequest, SubmitOrderRequest,
+            ListAssetsParams, ListOrdersParams, ORDERS_MAX_PAGE_SIZE, ReplaceOrderRequest,
+            SubmitOrderRequest,
         },
     },
 };
@@ -429,6 +430,65 @@ impl AlpacaRawHttpClient {
         let query = Self::encode_query(params)?;
         self.send_request(Method::GET, ApiTarget::Trading, &path, query, None)
             .await
+    }
+
+    /// Requests orders, following the time cursor until the venue runs out.
+    ///
+    /// Orders come back newest first with no page token. The cursor is `until`, set to the oldest
+    /// `submitted_at` on the page just read, and the bound is exclusive so the boundary order is
+    /// not repeated. A page shorter than the limit is the last one.
+    ///
+    /// Two orders submitted in the same microsecond would straddle that boundary and the older of
+    /// the pair would be missed. The venue timestamps to microseconds and none of the 500 orders
+    /// this was checked against shared one, so it is unlikely rather than impossible; a caller
+    /// that cannot tolerate it should bound the request with a window instead of paging.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or any request fails.
+    pub async fn list_orders_all_pages(
+        &self,
+        params: &ListOrdersParams,
+        max_pages: usize,
+    ) -> Result<Vec<AlpacaOrder>> {
+        let limit = params.limit.unwrap_or(ORDERS_MAX_PAGE_SIZE) as usize;
+        let mut collected: Vec<AlpacaOrder> = Vec::new();
+        let mut page_params = params.clone();
+
+        for page in 0..max_pages {
+            let orders = self.list_orders(&page_params).await?;
+            let received = orders.len();
+            let cursor = orders.last().and_then(|order| order.submitted_at.clone());
+            collected.extend(orders);
+
+            if received < limit {
+                return Ok(collected);
+            }
+
+            // Without a timestamp there is no cursor to advance, and repeating the request would
+            // return the same page forever.
+            match cursor {
+                Some(until) => page_params.until = Some(until),
+                None => {
+                    log::warn!(
+                        "Alpaca orders pagination stopped after {} records: the last order carries \
+                         no submitted_at, so there is no cursor to follow",
+                        collected.len(),
+                    );
+                    return Ok(collected);
+                }
+            }
+
+            if page + 1 == max_pages {
+                log::warn!(
+                    "Alpaca orders pagination stopped at the {max_pages}-page limit after {} \
+                     records; earlier orders are missing from this result",
+                    collected.len(),
+                );
+            }
+        }
+
+        Ok(collected)
     }
 
     /// Requests a single order by venue identifier.

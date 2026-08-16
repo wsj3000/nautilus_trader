@@ -137,7 +137,19 @@ pub struct ListOrdersParams {
     /// Whether to include the legs of multi-leg orders.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nested: Option<bool>,
+    /// Return orders submitted after this timestamp (RFC 3339), exclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Return orders submitted before this timestamp (RFC 3339), exclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
 }
+
+/// The largest page the orders endpoint returns.
+///
+/// Unlike the activities endpoint, which rejects an oversized request, this one silently reduces
+/// it — so a caller that asked for more and counted the answer would conclude it had everything.
+pub const ORDERS_MAX_PAGE_SIZE: u32 = 500;
 
 impl ListOrdersParams {
     /// Returns parameters selecting all working orders.
@@ -145,8 +157,34 @@ impl ListOrdersParams {
     pub fn open() -> Self {
         Self {
             status: Some("open".to_string()),
+            limit: Some(ORDERS_MAX_PAGE_SIZE),
             ..Self::default()
         }
+    }
+
+    /// Returns parameters selecting orders in any state, working or finished.
+    #[must_use]
+    pub fn all() -> Self {
+        Self {
+            status: Some("all".to_string()),
+            limit: Some(ORDERS_MAX_PAGE_SIZE),
+            ..Self::default()
+        }
+    }
+
+    /// Returns these parameters restricted to one symbol.
+    #[must_use]
+    pub fn with_symbol(mut self, symbol: &str) -> Self {
+        self.symbols = Some(symbol.to_string());
+        self
+    }
+
+    /// Returns these parameters bounded by the given RFC 3339 timestamps.
+    #[must_use]
+    pub fn with_window(mut self, after: Option<String>, until: Option<String>) -> Self {
+        self.after = after;
+        self.until = until;
+        self
     }
 }
 

@@ -92,6 +92,12 @@ use crate::{
 /// rather than a larger limit here.
 const MAX_ACTIVITY_PAGES: usize = 50;
 
+/// Maximum pages walked when following the orders time cursor.
+///
+/// The venue returns at most 500 orders per page, so this admits 10,000. Beyond that the caller
+/// wants a narrower window rather than a larger limit here.
+const MAX_ORDER_PAGES: usize = 20;
+
 /// Tracks the venue identifier an order currently trades under.
 ///
 /// Nautilus addresses an order by the identifier it was first accepted with, while Alpaca issues a
@@ -777,11 +783,28 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     async fn generate_order_status_reports(
         &self,
-        _cmd: &GenerateOrderStatusReports,
+        cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        // `open_only` is the engine telling us whether finished orders matter. When it is false it
+        // expects recently closed orders in the answer, and returning only working ones leaves it
+        // querying each of them individually to find out what happened.
+        let mut params = if cmd.open_only {
+            ListOrdersParams::open()
+        } else {
+            ListOrdersParams::all()
+        }
+        .with_window(
+            cmd.start.map(|nanos| nanos.to_rfc3339()),
+            cmd.end.map(|nanos| nanos.to_rfc3339()),
+        );
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            params = params.with_symbol(instrument_id.symbol.as_str());
+        }
+
         let orders = self
             .http_client
-            .list_orders(&ListOrdersParams::open())
+            .list_orders_all_pages(&params, MAX_ORDER_PAGES)
             .await?;
 
         Ok(self.reports_from_orders(&orders))

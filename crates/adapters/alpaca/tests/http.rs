@@ -15,8 +15,9 @@
 
 //! Integration tests for the Alpaca HTTP client against a mock Axum server.
 //!
-//! These cover the activities cursor, which cannot be tested from the payload fixtures: paging is
-//! about the sequence of requests, not the shape of any one response.
+//! These cover the two paging cursors, which cannot be tested from the payload fixtures: paging is
+//! about the sequence of requests, not the shape of any one response. Activities page on an
+//! opaque token; orders page on an exclusive time bound.
 
 use std::{
     net::SocketAddr,
@@ -29,19 +30,34 @@ use std::{
 use axum::{Router, extract::Query, response::Json, routing::get};
 use nautilus_alpaca::{
     common::{credential::AlpacaCredential, enums::AlpacaEnvironment},
-    http::{client::AlpacaRawHttpClient, query::ActivitiesParams},
+    http::{
+        client::AlpacaRawHttpClient,
+        query::{ActivitiesParams, ListOrdersParams},
+    },
 };
 use rstest::rstest;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// The venue's own page ceiling.
+/// The venue's own page ceiling for activities.
 const PAGE_SIZE: usize = 100;
+
+/// The venue's own page ceiling for orders.
+const ORDERS_PAGE_SIZE: usize = 500;
 
 #[derive(Debug, Deserialize)]
 struct ActivitiesQuery {
     page_size: Option<usize>,
     page_token: Option<String>,
+    after: Option<String>,
+    until: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrdersQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+    symbols: Option<String>,
     after: Option<String>,
     until: Option<String>,
 }
@@ -232,4 +248,170 @@ async fn test_activities_window_is_sent_on_every_page() {
             )
         );
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+//  Orders
+// -------------------------------------------------------------------------------------------------
+
+/// Records the status, symbol, and window each orders request carried.
+#[derive(Debug, Clone, Default)]
+struct OrdersRecorder {
+    statuses: Arc<Mutex<Vec<Option<String>>>>,
+    symbols: Arc<Mutex<Vec<Option<String>>>>,
+    windows: Arc<Mutex<Vec<Window>>>,
+    requests: Arc<AtomicUsize>,
+}
+
+/// Orders are timestamped one second apart, newest first, so `index` and time run in opposite
+/// directions exactly as they do at the venue.
+fn order(index: usize) -> Value {
+    let seconds = 100_000 - index;
+    json!({
+        "id": format!("0000aaaa-0000-4000-8000-{index:012}"),
+        "client_order_id": format!("C-{index}"),
+        "symbol": "AAPL",
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "day",
+        "status": "filled",
+        "qty": "1",
+        "filled_qty": "1",
+        "limit_price": "200.00",
+        "submitted_at": format!("2026-06-25T{:02}:{:02}:{:02}Z", seconds / 3600 % 24, seconds / 60 % 60, seconds % 60),
+        "created_at": "2026-06-25T00:00:00Z",
+    })
+}
+
+/// Serves `total` orders newest first, paging on the exclusive `until` cursor as the venue does.
+async fn start_orders_server(total: usize, recorder: OrdersRecorder) -> SocketAddr {
+    let router = Router::new().route(
+        "/v2/orders",
+        get(move |Query(query): Query<OrdersQuery>| {
+            let recorder = recorder.clone();
+            async move {
+                recorder.requests.fetch_add(1, Ordering::SeqCst);
+                recorder.statuses.lock().unwrap().push(query.status.clone());
+                recorder.symbols.lock().unwrap().push(query.symbols.clone());
+                recorder
+                    .windows
+                    .lock()
+                    .unwrap()
+                    .push((query.after.clone(), query.until.clone()));
+
+                let limit = query.limit.unwrap_or(ORDERS_PAGE_SIZE);
+                // `until` is exclusive at the venue, so the boundary order is not served again.
+                let start = match query.until {
+                    Some(until) => (0..total)
+                        .find(|i| order(*i)["submitted_at"].as_str().unwrap() < until.as_str())
+                        .unwrap_or(total),
+                    None => 0,
+                };
+                let end = total.min(start + limit);
+                let page: Vec<Value> = (start..end).map(order).collect();
+                Json(page)
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_orders_paging_follows_the_time_cursor() {
+    let recorder = OrdersRecorder::default();
+    let addr = start_orders_server(1_200, recorder.clone()).await;
+
+    let orders = client(addr)
+        .list_orders_all_pages(&ListOrdersParams::all(), 10)
+        .await
+        .unwrap();
+
+    assert_eq!(orders.len(), 1_200);
+    // Two full pages of 500 and a short third that ends the walk.
+    assert_eq!(recorder.requests.load(Ordering::SeqCst), 3);
+
+    // No order is served twice: the cursor bound is exclusive, so a page boundary that repeated
+    // its edge would double-count an order in reconciliation.
+    let ids: std::collections::HashSet<_> = orders.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(ids.len(), 1_200);
+
+    let windows = recorder.windows.lock().unwrap().clone();
+    assert_eq!(windows[0].1, None, "the first request carries no cursor");
+    assert!(windows[1].1.is_some() && windows[2].1.is_some());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_orders_paging_stops_on_a_short_page() {
+    let recorder = OrdersRecorder::default();
+    let addr = start_orders_server(12, recorder.clone()).await;
+
+    let orders = client(addr)
+        .list_orders_all_pages(&ListOrdersParams::open(), 10)
+        .await
+        .unwrap();
+
+    assert_eq!(orders.len(), 12);
+    assert_eq!(recorder.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        recorder.statuses.lock().unwrap()[0],
+        Some("open".to_string())
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_orders_paging_stops_at_the_page_limit() {
+    let recorder = OrdersRecorder::default();
+    let addr = start_orders_server(5_000, recorder.clone()).await;
+
+    let orders = client(addr)
+        .list_orders_all_pages(&ListOrdersParams::all(), 2)
+        .await
+        .unwrap();
+
+    // Truncated rather than walked to the end, and the client logs that it stopped short —
+    // silently returning part of the history would read as the whole of it.
+    assert_eq!(orders.len(), 1_000);
+    assert_eq!(recorder.requests.load(Ordering::SeqCst), 2);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_orders_status_and_symbol_reach_the_venue() {
+    let recorder = OrdersRecorder::default();
+    let addr = start_orders_server(3, recorder.clone()).await;
+
+    let params = ListOrdersParams::all().with_symbol("AAPL").with_window(
+        Some("2026-06-01T00:00:00Z".to_string()),
+        Some("2026-07-01T00:00:00Z".to_string()),
+    );
+    client(addr)
+        .list_orders_all_pages(&params, 5)
+        .await
+        .unwrap();
+
+    // `status=all` is what makes finished orders visible; dropping it would send the engine back
+    // to querying each closed order one at a time.
+    assert_eq!(
+        recorder.statuses.lock().unwrap()[0],
+        Some("all".to_string())
+    );
+    assert_eq!(
+        recorder.symbols.lock().unwrap()[0],
+        Some("AAPL".to_string())
+    );
+    assert_eq!(
+        recorder.windows.lock().unwrap()[0].0,
+        Some("2026-06-01T00:00:00Z".to_string())
+    );
 }

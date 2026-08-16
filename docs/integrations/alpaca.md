@@ -196,6 +196,28 @@ Whether that UUID is the *same value* the stream reports has not been confirmed;
 observed on both paths, which needs an open market. If it matches, a recovered fill and the live
 one de-duplicate to a single trade; if not, one execution would reach the engine as two.
 
+### Order reports
+
+`generate_order_status_reports` follows the command's `open_only` flag: set, it asks for
+`status=open`; clear, it asks for `status=all`, because the engine then expects recently finished
+orders in the answer and will otherwise query each of them one at a time to find out what
+happened. The command's instrument and time window are passed through as `symbols`, `after`, and
+`until`.
+
+The two paginated endpoints work differently, and neither reports that more data exists:
+
+| | Page size | Cursor | Oversized request |
+| --- | --- | --- | --- |
+| `/v2/account/activities` | 100 | the last record's `id` | rejected, code 40010001 |
+| `/v2/orders` | 500 | `until`, set to the last order's `submitted_at`, exclusive | silently reduced to 500 |
+
+The orders cursor is a timestamp, so two orders submitted in the same microsecond would straddle a
+page boundary and the older of the pair would be missed. The venue timestamps to microseconds and
+none of the 500 orders this was checked against shared one, so it is unlikely rather than
+impossible; bound the request with a window rather than paging if that matters. Both walks stop at
+a page limit and log when they do, since a truncated history that said nothing would read as a
+complete one.
+
 ### Known limitations
 
 - `cancel_all_orders` is account-wide at the venue; the instrument scope on the command cannot be honoured.
