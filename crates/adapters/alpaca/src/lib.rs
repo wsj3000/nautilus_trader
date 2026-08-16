@@ -32,13 +32,7 @@
 //!
 //! # Feature Flags
 //!
-//! This crate provides feature flags to control source code inclusion during compilation,
-//! depending on the intended use case, i.e. whether to provide Python bindings
-//! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
-//! or as part of a Rust only build.
-//!
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-//! - `extension-module`: Builds as a Python extension module.
+//! This crate is Rust-only and exposes no Python bindings; the adapter is driven from Rust.
 //!
 //! [High-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) (128-bit value types) is enabled by default.
 
@@ -57,8 +51,6 @@ pub mod factories;
 pub mod http;
 pub mod provider;
 
-#[cfg(feature = "python")]
-pub mod python;
 pub mod websocket;
 
 pub use crate::{

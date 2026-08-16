@@ -50,14 +50,6 @@ impl ClientConfig for AlpacaExecClientConfig {
 
 /// Factory for creating Alpaca data clients.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.alpaca", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.alpaca")
-)]
 pub struct AlpacaDataClientFactory;
 
 impl AlpacaDataClientFactory {
@@ -112,14 +104,6 @@ impl DataClientFactory for AlpacaDataClientFactory {
 /// configuration, and the venue reports the distinction, so `Cash` is used as the declared type
 /// and margin detail comes from the account state.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.alpaca", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.alpaca")
-)]
 pub struct AlpacaExecutionClientFactory {
     trader_id: TraderId,
     account_id: AccountId,

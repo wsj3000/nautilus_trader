@@ -23,19 +23,6 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
 /// Defaults to [`AlpacaEnvironment::Paper`] so that an unconfigured client cannot reach the
 /// live trading endpoint and transact real capital.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.adapters.alpaca",
-        eq,
-        from_py_object,
-        rename_all = "SCREAMING_SNAKE_CASE"
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.alpaca")
-)]
 pub enum AlpacaEnvironment {
     /// Paper trading environment.
     #[default]
@@ -79,19 +66,6 @@ impl AlpacaEnvironment {
 )]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.adapters.alpaca",
-        eq,
-        from_py_object,
-        rename_all = "SCREAMING_SNAKE_CASE"
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.alpaca")
-)]
 pub enum AlpacaDataFeed {
     /// Consolidated Securities Information Processor feed, covering the regular session
     /// across all US exchanges.

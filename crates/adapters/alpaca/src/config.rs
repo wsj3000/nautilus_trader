@@ -26,14 +26,6 @@ use crate::common::{
 /// Configuration for the Alpaca data client.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.alpaca", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.alpaca")
-)]
 pub struct AlpacaDataClientConfig {
     /// API key ID (falls back to `APCA_API_KEY_ID` env var).
     pub api_key: Option<String>,
@@ -94,22 +86,6 @@ pub struct AlpacaDataClientConfig {
     pub transport_backend: TransportBackend,
 }
 
-#[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(AlpacaDataClientConfig {
-    base_url_rest: Option<String>,
-    base_url_trading: Option<String>,
-    base_url_ws: Option<String>,
-    environment: AlpacaEnvironment,
-    feed: AlpacaDataFeed,
-    http_timeout_secs: u64,
-    ws_timeout_secs: u64,
-    update_instruments_interval_mins: u64,
-    poll_interval_secs: u64,
-    poll_window_mins: u64,
-    calendar_lookahead_days: u32,
-    transport_backend: TransportBackend,
-});
-
 impl Default for AlpacaDataClientConfig {
     fn default() -> Self {
         Self::builder().build()
@@ -160,14 +136,6 @@ impl AlpacaDataClientConfig {
 /// Configuration for the Alpaca execution client.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.alpaca", from_py_object)
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.alpaca")
-)]
 pub struct AlpacaExecClientConfig {
     /// API key ID (falls back to `APCA_API_KEY_ID` env var).
     pub api_key: Option<String>,
@@ -205,19 +173,6 @@ pub struct AlpacaExecClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
-
-#[cfg(feature = "python")]
-nautilus_core::impl_pyo3_config_getters!(AlpacaExecClientConfig {
-    base_url_rest: Option<String>,
-    base_url_ws: Option<String>,
-    environment: AlpacaEnvironment,
-    http_timeout_secs: u64,
-    max_retries: u32,
-    retry_delay_initial_ms: u64,
-    retry_delay_max_ms: u64,
-    default_extended_hours: bool,
-    transport_backend: TransportBackend,
-});
 
 impl Default for AlpacaExecClientConfig {
     fn default() -> Self {

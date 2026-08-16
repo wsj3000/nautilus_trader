@@ -6,8 +6,7 @@ overnight session, giving continuous 24/5 coverage.
 
 ## Overview
 
-The Alpaca adapter is implemented in Rust and exposed to Python through configurations,
-factories, enums, and constants.
+The Alpaca adapter is implemented in Rust.
 
 Components:
 
@@ -19,12 +18,7 @@ Components:
 - `AlpacaExecutionClientFactory`: Execution client factory.
 - `SessionCalendar`: Trading session resolution driving the SIP/overnight feed switch.
 
-Python surface available from `nautilus_trader.adapters.alpaca`:
-
-- `AlpacaDataClientConfig`, `AlpacaExecClientConfig`
-- `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory`
-- `AlpacaEnvironment`, `AlpacaDataFeed`
-- `ALPACA`, `ALPACA_CLIENT_ID`, and `ALPACA_VENUE`
+This adapter is Rust-only and exposes no Python bindings; a node using it is assembled in Rust.
 
 ## Scope
 
@@ -185,24 +179,42 @@ execution is redelivered, and without that identifier a repeat cannot be told fr
 
 ## Configuration
 
-```python
-from nautilus_trader.adapters.alpaca import AlpacaDataClientConfig
-from nautilus_trader.adapters.alpaca import AlpacaDataFeed
-from nautilus_trader.adapters.alpaca import AlpacaEnvironment
-from nautilus_trader.adapters.alpaca import AlpacaExecClientConfig
+```rust
+use nautilus_alpaca::{
+    common::enums::{AlpacaDataFeed, AlpacaEnvironment},
+    config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
+};
 
-data_config = AlpacaDataClientConfig(
-    environment=AlpacaEnvironment.PAPER,
-    feed=AlpacaDataFeed.SIP,
-    poll_interval_secs=15,
-    poll_window_mins=5,
-)
+let data_config = AlpacaDataClientConfig {
+    environment: AlpacaEnvironment::Paper,
+    feed: AlpacaDataFeed::Sip,
+    poll_interval_secs: 15,
+    poll_window_mins: 5,
+    ..AlpacaDataClientConfig::default()
+};
 
-exec_config = AlpacaExecClientConfig(
-    environment=AlpacaEnvironment.PAPER,
-    default_extended_hours=False,
-)
+let exec_config = AlpacaExecClientConfig {
+    environment: AlpacaEnvironment::Paper,
+    default_extended_hours: false,
+    ..AlpacaExecClientConfig::default()
+};
 ```
+
+## Routing through a proxy
+
+The three base URL overrides point the clients somewhere other than the venue, which is how the
+official SDK can be placed in front without changing adapter code:
+
+```rust
+let data_config = AlpacaDataClientConfig {
+    base_url_rest: Some("http://127.0.0.1:8765".to_string()),
+    base_url_trading: Some("http://127.0.0.1:8765".to_string()),
+    base_url_ws: Some("ws://127.0.0.1:8765/stream".to_string()),
+    ..AlpacaDataClientConfig::default()
+};
+```
+
+Clearing them sends the clients straight back to the venue.
 
 `poll_window_mins` sets how much history each poll requests. Widening it costs nothing extra per
 request and increases tolerance to missed polls.

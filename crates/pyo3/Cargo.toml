@@ -37,7 +37,6 @@ defi = [
 extension-module = [
   "nautilus-analysis/extension-module",
   "nautilus-architect-ax/extension-module",
-  "nautilus-alpaca/extension-module",
   "nautilus-backtest/extension-module",
   "nautilus-betfair?/extension-module",
   "nautilus-binance/extension-module",
@@ -78,7 +77,6 @@ high-precision = [
   "nautilus-model/high-precision",
   "nautilus-serialization/high-precision",
   "nautilus-testkit/high-precision",
-  "nautilus-alpaca/high-precision",
   "nautilus-betfair?/high-precision",
   "nautilus-binance/high-precision",
   "nautilus-bitmex/high-precision",
@@ -144,7 +142,6 @@ nautilus-bitmex = { workspace = true, features = ["python"] }
 nautilus-blockchain = { workspace = true, features = [
   "python",
 ], optional = true }
-nautilus-alpaca = { workspace = true, features = ["python"] }
 nautilus-bybit = { workspace = true, features = ["python"] }
 nautilus-coinbase = { workspace = true, features = ["python"] }
 nautilus-databento = { workspace = true, features = ["python", "live"] }
