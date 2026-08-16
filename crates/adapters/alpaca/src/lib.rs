@@ -55,6 +55,7 @@ pub mod data;
 pub mod execution;
 pub mod http;
 pub mod provider;
+pub mod websocket;
 
 pub use crate::{
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},

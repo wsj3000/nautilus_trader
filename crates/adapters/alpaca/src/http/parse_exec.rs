@@ -17,16 +17,19 @@
 
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    enums::{OrderStatus, PositionSideSpecified},
-    identifiers::{AccountId, ClientOrderId, VenueOrderId},
-    reports::{OrderStatusReport, PositionStatusReport},
-    types::{Price, Quantity},
+    enums::{LiquiditySide, OrderStatus, PositionSideSpecified},
+    identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
+    types::{Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 
-use crate::http::{
-    models::{AlpacaOrder, AlpacaPosition},
-    parse::{instrument_id, parse_rfc3339_nanos},
+use crate::{
+    http::{
+        models::{AlpacaOrder, AlpacaPosition},
+        parse::{instrument_id, parse_rfc3339_nanos},
+    },
+    websocket::messages::TradeUpdate,
 };
 
 /// Parses a decimal string exactly, without an intermediate float.
@@ -177,6 +180,77 @@ pub fn parse_position_status_report(
         None,
         None,
         avg_px_open,
+    ))
+}
+
+/// Converts a fill-bearing trade update into a Nautilus fill report.
+///
+/// # Commission
+///
+/// Alpaca reports no per-fill commission on this stream, and US equity trading there is
+/// commission-free, so zero is recorded. Inventing a figure would corrupt realised PnL.
+///
+/// # Liquidity
+///
+/// The venue does not say whether the fill took or made liquidity, so it is left unspecified
+/// rather than guessed.
+///
+/// # Errors
+///
+/// Returns an error if the update carries no execution detail, or if any value cannot be
+/// converted.
+pub fn parse_fill_report(
+    update: &TradeUpdate,
+    account_id: AccountId,
+    price_precision: u8,
+    ts_init: UnixNanos,
+) -> anyhow::Result<FillReport> {
+    if !update.has_fill_detail() {
+        anyhow::bail!(
+            "Trade update '{}' for order {} carries no execution detail",
+            update.event,
+            update.order.id
+        );
+    }
+
+    let raw_price = update
+        .price
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Fill for order {} has no price", update.order.id))?;
+    let raw_qty = update
+        .qty
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Fill for order {} has no quantity", update.order.id))?;
+
+    // Without an execution identifier a redelivered fill after a reconnect cannot be told from a
+    // new one, and would be counted twice.
+    let trade_id = update
+        .execution_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Fill for order {} has no execution ID", update.order.id))?;
+
+    let ts_event = match update.timestamp.as_deref() {
+        Some(raw) => parse_rfc3339_nanos(raw)?,
+        None => ts_init,
+    };
+
+    let currency = Currency::USD();
+
+    Ok(FillReport::new(
+        account_id,
+        instrument_id(&update.order.symbol),
+        VenueOrderId::new(update.order.id.as_str()),
+        TradeId::new(trade_id),
+        update.order.side.to_nautilus()?,
+        parse_quantity(raw_qty, "qty")?,
+        parse_price(raw_price, "price", price_precision)?,
+        Money::new(0.0, currency),
+        LiquiditySide::NoLiquiditySide,
+        Some(ClientOrderId::new(update.order.client_order_id.as_str())),
+        None,
+        ts_event,
+        ts_init,
+        None,
     ))
 }
 
@@ -393,5 +467,81 @@ mod tests {
     #[case(OrderStatus::Rejected, false)]
     fn test_open_status_classification(#[case] status: OrderStatus, #[case] expected: bool) {
         assert_eq!(is_open_status(status), expected);
+    }
+
+    fn fill_update(execution_id: Option<&str>, price: Option<&str>) -> TradeUpdate {
+        let exec = execution_id.map_or("null".to_string(), |id| format!("\"{id}\""));
+        let px = price.map_or("null".to_string(), |p| format!("\"{p}\""));
+        let json = format!(
+            r#"{{
+                "event": "fill",
+                "timestamp": "2026-08-14T14:30:05.123456Z",
+                "price": {px},
+                "qty": "10",
+                "execution_id": {exec},
+                "order": {{
+                    "id": "o-1", "client_order_id": "c-1", "symbol": "AAPL",
+                    "type": "limit", "side": "buy", "time_in_force": "day",
+                    "status": "filled", "qty": "10", "filled_qty": "10"
+                }}
+            }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[rstest]
+    fn test_parse_fill_report() {
+        let update = fill_update(Some("e-1"), Some("300.005"));
+        let report = parse_fill_report(&update, account(), 4, UnixNanos::from(9)).unwrap();
+
+        assert_eq!(report.instrument_id.to_string(), "AAPL.ALPACA");
+        assert_eq!(report.venue_order_id, VenueOrderId::new("o-1"));
+        assert_eq!(report.trade_id, TradeId::new("e-1"));
+        assert_eq!(report.last_qty, Quantity::new(10.0, 0));
+        assert_eq!(report.last_px, Price::new(300.005, 4));
+        assert_eq!(report.ts_init, UnixNanos::from(9));
+    }
+
+    #[rstest]
+    fn test_fill_report_records_zero_commission() {
+        // US equity trading on this venue is commission-free and the stream reports none;
+        // inventing a figure would corrupt realised PnL.
+        let report = parse_fill_report(
+            &fill_update(Some("e-1"), Some("300.00")),
+            account(),
+            4,
+            UnixNanos::default(),
+        )
+        .unwrap();
+        assert_eq!(report.commission, Money::new(0.0, Currency::USD()));
+        assert_eq!(report.liquidity_side, LiquiditySide::NoLiquiditySide);
+    }
+
+    #[rstest]
+    fn test_fill_without_execution_id_is_refused() {
+        // Without it a redelivered fill after a reconnect cannot be distinguished from a new one.
+        let update = fill_update(None, Some("300.00"));
+        let err = parse_fill_report(&update, account(), 4, UnixNanos::default()).unwrap_err();
+        assert!(err.to_string().contains("execution ID"), "{err}");
+    }
+
+    #[rstest]
+    fn test_fill_without_price_is_refused() {
+        let update = fill_update(Some("e-1"), None);
+        assert!(parse_fill_report(&update, account(), 4, UnixNanos::default()).is_err());
+    }
+
+    #[rstest]
+    fn test_non_fill_update_is_refused() {
+        let json = r#"{
+            "event": "accepted",
+            "order": {
+                "id": "o-1", "client_order_id": "c-1", "symbol": "AAPL", "type": "limit",
+                "side": "buy", "time_in_force": "day", "status": "accepted", "qty": "10"
+            }
+        }"#;
+        let update: TradeUpdate = serde_json::from_str(json).unwrap();
+        let err = parse_fill_report(&update, account(), 4, UnixNanos::default()).unwrap_err();
+        assert!(err.to_string().contains("no execution detail"), "{err}");
     }
 }

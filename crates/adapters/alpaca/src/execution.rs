@@ -73,8 +73,15 @@ use crate::{
     http::{
         client::AlpacaRawHttpClient,
         models::AlpacaOrder,
-        parse_exec::{parse_decimal, parse_order_status_report, parse_position_status_report},
+        parse_exec::{
+            parse_decimal, parse_fill_report, parse_order_status_report,
+            parse_position_status_report,
+        },
         query::{ListOrdersParams, ReplaceOrderRequest, SubmitOrderRequest},
+    },
+    websocket::{
+        client::connect_trading_stream,
+        messages::{AlpacaTradeEvent, TradeUpdate},
     },
 };
 
@@ -124,6 +131,7 @@ pub struct AlpacaExecutionClient {
     chain: Arc<Mutex<ReplacementChain>>,
     account: Arc<Mutex<Option<AccountAny>>>,
     cancellation_token: CancellationToken,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
     clock: &'static AtomicTime,
 }
 
@@ -174,6 +182,7 @@ impl AlpacaExecutionClient {
             chain: Arc::new(Mutex::new(ReplacementChain::default())),
             account: Arc::new(Mutex::new(None)),
             cancellation_token: CancellationToken::new(),
+            tasks: Vec::new(),
             clock,
         })
     }
@@ -305,6 +314,128 @@ impl AlpacaExecutionClient {
         Ok(())
     }
 
+    /// Consumes the trading event stream, publishing reports as events arrive.
+    ///
+    /// Fills become fill reports and everything else becomes an order status report, so the
+    /// engine learns about venue-side activity it did not initiate. A `replaced` event records the
+    /// new identifier in the chain: the venue may replace an order without the engine asking, and
+    /// losing that link would leave later cancels addressing a dead identifier.
+    fn spawn_stream_task(&mut self) -> anyhow::Result<()> {
+        let Some(credential) = AlpacaCredential::resolve(
+            self.config.api_key.as_deref(),
+            self.config.api_secret.as_deref(),
+        ) else {
+            anyhow::bail!("Cannot open the Alpaca trading stream without credentials");
+        };
+
+        let environment = self.config.environment;
+        let url_override = self.config.base_url_ws.clone();
+        let emitter = self.emitter.clone();
+        let chain = self.chain.clone();
+        let account_id = self.core.account_id;
+        let token = self.cancellation_token.clone();
+        let clock = self.clock;
+
+        let handle = nautilus_common::live::runtime::get_runtime().spawn(async move {
+            let mut stream =
+                match connect_trading_stream(environment, &credential, url_override).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        log::error!("Failed to open the Alpaca trading stream: {e}");
+                        return;
+                    }
+                };
+
+            loop {
+                let update = tokio::select! {
+                    () = token.cancelled() => {
+                        log::debug!("Alpaca trading stream task cancelled");
+                        return;
+                    }
+                    update = stream.next_update() => update,
+                };
+
+                let Some(update) = update else {
+                    log::warn!("Alpaca trading stream closed");
+                    return;
+                };
+
+                let update = match update {
+                    Ok(update) => update,
+                    Err(e) => {
+                        // A frame that claimed to be a trade update but could not be decoded means
+                        // an order event was lost, which is worth an error rather than a debug.
+                        log::error!("Alpaca trade update could not be decoded: {e}");
+                        continue;
+                    }
+                };
+
+                Self::handle_update(&update, &emitter, &chain, account_id, clock.get_time_ns())
+                    .await;
+            }
+        });
+
+        self.tasks.push(handle);
+        Ok(())
+    }
+
+    /// Publishes one trade update.
+    async fn handle_update(
+        update: &TradeUpdate,
+        emitter: &ExecutionEventEmitter,
+        chain: &Mutex<ReplacementChain>,
+        account_id: AccountId,
+        ts_init: UnixNanos,
+    ) {
+        let kind = update.event_kind();
+
+        if kind == AlpacaTradeEvent::Unknown {
+            // Named rather than counted, so an unmodelled event can actually be chased down.
+            log::warn!(
+                "Unmodelled Alpaca trade event '{}' for order {}",
+                update.event,
+                update.order.id
+            );
+        }
+
+        if kind == AlpacaTradeEvent::Replaced
+            && let Some(replaced_by) = update.order.replaced_by.as_deref()
+        {
+            chain.lock().await.record(
+                VenueOrderId::new(update.order.id.as_str()),
+                VenueOrderId::new(replaced_by),
+            );
+        }
+
+        if update.has_fill_detail() {
+            match parse_fill_report(update, account_id, reg_nms::PRICE_PRECISION, ts_init) {
+                Ok(report) => emitter.send_fill_report(report),
+                Err(e) => log::error!("Cannot build an Alpaca fill report: {e}"),
+            }
+            return;
+        }
+
+        if kind.is_request_rejection() {
+            // The order is untouched by a refused request; a status report would say nothing new.
+            log::warn!(
+                "Alpaca refused a request on order {} ({})",
+                update.order.id,
+                update.event
+            );
+            return;
+        }
+
+        match parse_order_status_report(
+            &update.order,
+            account_id,
+            reg_nms::PRICE_PRECISION,
+            ts_init,
+        ) {
+            Ok(report) => emitter.send_order_status_report(report),
+            Err(e) => log::debug!("No status report for order {}: {e}", update.order.id),
+        }
+    }
+
     /// Resolves the identifier an order currently trades under.
     async fn live_venue_order_id(&self, venue_order_id: VenueOrderId) -> VenueOrderId {
         self.chain.lock().await.resolve(venue_order_id)
@@ -366,12 +497,16 @@ impl ExecutionClient for AlpacaExecutionClient {
             return Ok(());
         }
         self.refresh_account().await?;
+        self.spawn_stream_task()?;
         self.core.set_connected();
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
         self.cancellation_token.cancel();
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
         self.core.set_disconnected();
         Ok(())
     }
@@ -445,8 +580,13 @@ impl ExecutionClient for AlpacaExecutionClient {
             return Ok(());
         }
 
+        // Held so the rejection path can report against the order the engine knows.
+        let order = self.core.get_order(&cmd.client_order_id)?;
+
         let http_client = self.http_client.clone();
         let chain = self.chain.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
         let client_order_id = cmd.client_order_id;
         nautilus_common::live::runtime::get_runtime().spawn(async move {
             let live_id = chain.lock().await.resolve(venue_order_id);
@@ -456,7 +596,18 @@ impl ExecutionClient for AlpacaExecutionClient {
                     chain.lock().await.record(venue_order_id, new_id);
                     log::debug!("Alpaca replaced {live_id} with {new_id} for {client_order_id}");
                 }
-                Err(e) => log::error!("Failed to amend {client_order_id}: {e}"),
+                Err(e) => {
+                    // The venue refuses amendments in several states — an order that has been
+                    // received but not yet routed cannot be replaced, for one. The order is still
+                    // working, so the engine has to hear that its request failed rather than be
+                    // left waiting for an update that will never come.
+                    emitter.emit_order_modify_rejected(
+                        &order,
+                        Some(live_id),
+                        &e.to_string(),
+                        clock.get_time_ns(),
+                    );
+                }
             }
         });
 
@@ -468,8 +619,12 @@ impl ExecutionClient for AlpacaExecutionClient {
             anyhow::bail!("Cannot cancel {}: no venue order ID", cmd.client_order_id);
         };
 
+        let order = self.core.get_order(&cmd.client_order_id)?;
+
         let http_client = self.http_client.clone();
         let chain = self.chain.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
         let client_order_id = cmd.client_order_id;
         nautilus_common::live::runtime::get_runtime().spawn(async move {
             let live_id = chain.lock().await.resolve(venue_order_id);
@@ -478,7 +633,16 @@ impl ExecutionClient for AlpacaExecutionClient {
                     chain.lock().await.forget(venue_order_id);
                     log::debug!("Alpaca canceled {live_id} for {client_order_id}");
                 }
-                Err(e) => log::error!("Failed to cancel {client_order_id}: {e}"),
+                Err(e) => {
+                    // A refused cancellation leaves the order working; the engine must not be left
+                    // believing it is on its way out.
+                    emitter.emit_order_cancel_rejected(
+                        &order,
+                        Some(live_id),
+                        &e.to_string(),
+                        clock.get_time_ns(),
+                    );
+                }
             }
         });
 
@@ -605,11 +769,12 @@ impl ExecutionClient for AlpacaExecutionClient {
         &self,
         _cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        // Alpaca publishes fill detail on the trade update stream rather than as a REST activity
-        // this adapter reads today. Returning an empty set here would look like "no fills", so the
-        // gap is reported instead.
+        // Fills arrive on the trading event stream and are published as they happen. There is no
+        // REST endpoint this adapter reads to reconstruct them on demand, and returning an empty
+        // set would read as "no fills", so the limitation is stated instead.
         anyhow::bail!(
-            "Alpaca fill reports require the trading event stream, which is not yet implemented"
+            "Alpaca fills are published from the trading event stream as they occur; they cannot \
+             be requested retrospectively through this client"
         )
     }
 
