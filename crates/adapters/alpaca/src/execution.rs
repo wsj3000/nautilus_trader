@@ -1,0 +1,718 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Execution client for Alpaca.
+//!
+//! # Amendments create new orders
+//!
+//! Alpaca implements an amendment as a replacement rather than an in-place edit: `PATCH` answers
+//! with a **new** order under a new identifier and moves the original to `replaced`. Nautilus
+//! expects an order to keep its venue identifier across a modification, so the two models do not
+//! line up.
+//!
+//! The client therefore keeps a chain from the identifier the engine knows to the one currently
+//! live at the venue, and resolves through it before every cancel, query, or amendment. Without
+//! that, the first amendment would leave the engine addressing an order the venue no longer acts
+//! on, and subsequent cancels would silently target a dead identifier.
+//!
+//! # Price validation
+//!
+//! Order prices are checked against Reg NMS Rule 612 before submission and **denied** rather than
+//! rounded. Rounding a price the caller specified changes their order; the regulator's own
+//! guidance is that such an order is rejected, and the venue rejects it too, so denying locally
+//! produces the same outcome without spending a round trip or a rate limit slot.
+
+use std::sync::Arc;
+
+use ahash::AHashMap;
+use anyhow::anyhow;
+use async_trait::async_trait;
+use nautilus_common::{
+    clients::ExecutionClient,
+    messages::execution::{
+        BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+    },
+};
+use nautilus_core::{
+    UnixNanos,
+    time::{AtomicTime, get_atomic_clock_realtime},
+};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_model::{
+    accounts::AccountAny,
+    enums::{OmsType, OrderType},
+    identifiers::{AccountId, ClientId, VenueOrderId},
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
+    types::{AccountBalance, Currency, MarginBalance, Money},
+};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    common::{
+        consts::ALPACA_VENUE,
+        credential::AlpacaCredential,
+        order_enums::{AlpacaOrderSide, AlpacaOrderType, AlpacaTimeInForce},
+        reg_nms,
+    },
+    config::AlpacaExecClientConfig,
+    http::{
+        client::AlpacaRawHttpClient,
+        models::AlpacaOrder,
+        parse_exec::{parse_decimal, parse_order_status_report, parse_position_status_report},
+        query::{ListOrdersParams, ReplaceOrderRequest, SubmitOrderRequest},
+    },
+};
+
+/// Tracks the venue identifier an order currently trades under.
+///
+/// Nautilus addresses an order by the identifier it was first accepted with, while Alpaca issues a
+/// new one on every amendment. The chain maps the former to the latter.
+#[derive(Debug, Default)]
+struct ReplacementChain {
+    current: AHashMap<VenueOrderId, VenueOrderId>,
+}
+
+impl ReplacementChain {
+    /// Records that `original` now trades as `replacement`.
+    ///
+    /// Chains collapse rather than nest: amending twice leaves the first identifier pointing
+    /// straight at the third, so resolution never walks more than one hop.
+    fn record(&mut self, original: VenueOrderId, replacement: VenueOrderId) {
+        let root = self
+            .current
+            .iter()
+            .find(|(_, live)| **live == original)
+            .map_or(original, |(root, _)| *root);
+        self.current.insert(root, replacement);
+    }
+
+    /// Returns the identifier currently live at the venue.
+    fn resolve(&self, venue_order_id: VenueOrderId) -> VenueOrderId {
+        self.current
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(venue_order_id)
+    }
+
+    fn forget(&mut self, venue_order_id: VenueOrderId) {
+        self.current.remove(&venue_order_id);
+    }
+}
+
+/// Execution client for Alpaca US equities.
+#[derive(Debug)]
+pub struct AlpacaExecutionClient {
+    core: ExecutionClientCore,
+    emitter: ExecutionEventEmitter,
+    config: AlpacaExecClientConfig,
+    http_client: Arc<AlpacaRawHttpClient>,
+    chain: Arc<Mutex<ReplacementChain>>,
+    account: Arc<Mutex<Option<AccountAny>>>,
+    cancellation_token: CancellationToken,
+    clock: &'static AtomicTime,
+}
+
+impl AlpacaExecutionClient {
+    /// Creates a new [`AlpacaExecutionClient`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    pub fn new(core: ExecutionClientCore, config: AlpacaExecClientConfig) -> anyhow::Result<Self> {
+        let credential =
+            AlpacaCredential::resolve(config.api_key.as_deref(), config.api_secret.as_deref());
+
+        let mut http_client = match credential {
+            Some(credential) => AlpacaRawHttpClient::with_credentials(
+                credential,
+                config.environment,
+                config.http_timeout_secs,
+                config.proxy_url.clone(),
+                None,
+            )?,
+            None => AlpacaRawHttpClient::new(
+                config.environment,
+                config.http_timeout_secs,
+                config.proxy_url.clone(),
+                None,
+            )?,
+        };
+
+        if let Some(url) = config.base_url_rest.clone() {
+            http_client.set_trading_base_url(url);
+        }
+
+        let clock = get_atomic_clock_realtime();
+        let emitter = ExecutionEventEmitter::new(
+            clock,
+            core.trader_id,
+            core.account_id,
+            core.account_type,
+            core.base_currency,
+        );
+
+        Ok(Self {
+            core,
+            emitter,
+            config,
+            http_client: Arc::new(http_client),
+            chain: Arc::new(Mutex::new(ReplacementChain::default())),
+            account: Arc::new(Mutex::new(None)),
+            cancellation_token: CancellationToken::new(),
+            clock,
+        })
+    }
+
+    /// Returns the event emitter.
+    #[must_use]
+    pub const fn emitter(&self) -> &ExecutionEventEmitter {
+        &self.emitter
+    }
+
+    /// Returns a mutable reference to the event emitter.
+    pub const fn emitter_mut(&mut self) -> &mut ExecutionEventEmitter {
+        &mut self.emitter
+    }
+
+    /// Builds the venue submission body for an order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the order cannot be expressed on the venue, or if a price violates
+    /// Rule 612.
+    fn build_submit_request(
+        cmd: &SubmitOrder,
+        extended_hours: bool,
+    ) -> anyhow::Result<SubmitOrderRequest> {
+        let init = &cmd.order_init;
+
+        let order_type = AlpacaOrderType::from_nautilus(init.order_type)?;
+        let side = AlpacaOrderSide::from_nautilus(init.order_side)?;
+        let time_in_force = AlpacaTimeInForce::from_nautilus(init.time_in_force)?;
+
+        if init.quantity.precision != 0 {
+            anyhow::bail!(
+                "Alpaca orders are whole shares; quantity {} carries a fraction",
+                init.quantity
+            );
+        }
+
+        let limit_price = match init.price {
+            Some(price) => {
+                reg_nms::check_order_price(price.as_decimal())?;
+                Some(price.to_string())
+            }
+            None => None,
+        };
+        let stop_price = match init.trigger_price {
+            Some(price) => {
+                reg_nms::check_order_price(price.as_decimal())?;
+                Some(price.to_string())
+            }
+            None => None,
+        };
+
+        if matches!(init.order_type, OrderType::Limit | OrderType::StopLimit)
+            && limit_price.is_none()
+        {
+            anyhow::bail!("A {:?} order requires a limit price", init.order_type);
+        }
+
+        Ok(SubmitOrderRequest {
+            symbol: cmd.instrument_id.symbol.to_string(),
+            qty: init.quantity.to_string(),
+            side,
+            order_type,
+            time_in_force,
+            client_order_id: Some(cmd.client_order_id.to_string()),
+            limit_price,
+            stop_price,
+            extended_hours,
+        })
+    }
+
+    /// Converts a venue account into balances for an account state event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the currency or any amount cannot be parsed.
+    fn account_balances(
+        account: &crate::http::models::Account,
+    ) -> anyhow::Result<Vec<AccountBalance>> {
+        let currency = Currency::try_from_str(&account.currency)
+            .ok_or_else(|| anyhow!("Unrecognised account currency '{}'", account.currency))?;
+
+        let total = parse_decimal(&account.equity, "equity")?;
+        let free = parse_decimal(&account.cash, "cash")?;
+        // The venue reports equity and cash rather than a locked figure, so the difference stands
+        // in for capital committed to positions and working orders.
+        let locked = (total - free).max(rust_decimal::Decimal::ZERO);
+
+        Ok(vec![AccountBalance::new(
+            Money::new(
+                total
+                    .try_into()
+                    .map_err(|_| anyhow!("Equity out of range: {total}"))?,
+                currency,
+            ),
+            Money::new(
+                locked
+                    .try_into()
+                    .map_err(|_| anyhow!("Locked balance out of range: {locked}"))?,
+                currency,
+            ),
+            Money::new(
+                free.try_into()
+                    .map_err(|_| anyhow!("Cash out of range: {free}"))?,
+                currency,
+            ),
+        )])
+    }
+
+    /// Fetches the account and emits its state.
+    async fn refresh_account(&self) -> anyhow::Result<()> {
+        let account = self.http_client.get_account().await?;
+
+        if account.is_blocked() {
+            log::error!(
+                "Alpaca account {} is blocked; orders will be rejected by the venue",
+                account.account_number
+            );
+        }
+
+        let balances = Self::account_balances(&account)?;
+        self.emitter.emit_account_state(
+            balances,
+            Vec::<MarginBalance>::new(),
+            true,
+            self.clock.get_time_ns(),
+        );
+        Ok(())
+    }
+
+    /// Resolves the identifier an order currently trades under.
+    async fn live_venue_order_id(&self, venue_order_id: VenueOrderId) -> VenueOrderId {
+        self.chain.lock().await.resolve(venue_order_id)
+    }
+}
+
+#[async_trait(?Send)]
+impl ExecutionClient for AlpacaExecutionClient {
+    fn is_connected(&self) -> bool {
+        self.core.is_connected()
+    }
+
+    fn client_id(&self) -> ClientId {
+        self.core.client_id
+    }
+
+    fn account_id(&self) -> AccountId {
+        self.core.account_id
+    }
+
+    fn venue(&self) -> nautilus_model::identifiers::Venue {
+        *ALPACA_VENUE
+    }
+
+    fn oms_type(&self) -> OmsType {
+        // Alpaca exposes one net position per symbol and offers no hedge mode.
+        OmsType::Netting
+    }
+
+    fn get_account(&self) -> Option<AccountAny> {
+        self.account.blocking_lock().clone()
+    }
+
+    fn generate_account_state(
+        &self,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        reported: bool,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<()> {
+        self.emitter
+            .emit_account_state(balances, margins, reported, ts_event);
+        Ok(())
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        self.core.set_started();
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        self.cancellation_token.cancel();
+        self.core.set_stopped();
+        Ok(())
+    }
+
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        if self.core.is_connected() {
+            return Ok(());
+        }
+        self.refresh_account().await?;
+        self.core.set_connected();
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.cancellation_token.cancel();
+        self.core.set_disconnected();
+        Ok(())
+    }
+
+    fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        let order = self.core.get_order(&cmd.client_order_id)?;
+
+        // Anything the venue cannot express, and any price the regulation forbids, is denied here
+        // rather than sent: the venue would reject it anyway, and denying locally keeps the
+        // rejection reason precise.
+        let request = match Self::build_submit_request(&cmd, self.config.default_extended_hours) {
+            Ok(request) => request,
+            Err(e) => {
+                self.emitter.emit_order_denied(&order, &e.to_string());
+                return Ok(());
+            }
+        };
+
+        self.emitter.emit_order_submitted(&order);
+
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        nautilus_common::live::runtime::get_runtime().spawn(async move {
+            match http_client.submit_order(&request).await {
+                Ok(venue_order) => {
+                    log::debug!(
+                        "Alpaca accepted order {} as {}",
+                        venue_order.client_order_id,
+                        venue_order.id
+                    );
+                    emitter.emit_order_accepted(
+                        &order,
+                        VenueOrderId::new(venue_order.id.as_str()),
+                        clock.get_time_ns(),
+                    );
+                }
+                Err(e) => {
+                    emitter.emit_order_rejected(&order, &e.to_string(), clock.get_time_ns(), false);
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        let Some(venue_order_id) = cmd.venue_order_id else {
+            anyhow::bail!("Cannot modify {}: no venue order ID", cmd.client_order_id);
+        };
+
+        let mut request = ReplaceOrderRequest::default();
+        if let Some(quantity) = cmd.quantity {
+            if quantity.precision != 0 {
+                anyhow::bail!("Alpaca orders are whole shares; quantity {quantity} has a fraction");
+            }
+            request.qty = Some(quantity.to_string());
+        }
+        if let Some(price) = cmd.price {
+            reg_nms::check_order_price(price.as_decimal())?;
+            request.limit_price = Some(price.to_string());
+        }
+        if let Some(price) = cmd.trigger_price {
+            reg_nms::check_order_price(price.as_decimal())?;
+            request.stop_price = Some(price.to_string());
+        }
+
+        if request.is_empty() {
+            // Sending this would still replace the order and issue a new identifier for no gain.
+            log::debug!("Ignoring empty amendment for {}", cmd.client_order_id);
+            return Ok(());
+        }
+
+        let http_client = self.http_client.clone();
+        let chain = self.chain.clone();
+        let client_order_id = cmd.client_order_id;
+        nautilus_common::live::runtime::get_runtime().spawn(async move {
+            let live_id = chain.lock().await.resolve(venue_order_id);
+            match http_client.replace_order(live_id.as_str(), &request).await {
+                Ok(replacement) => {
+                    let new_id = VenueOrderId::new(replacement.id.as_str());
+                    chain.lock().await.record(venue_order_id, new_id);
+                    log::debug!("Alpaca replaced {live_id} with {new_id} for {client_order_id}");
+                }
+                Err(e) => log::error!("Failed to amend {client_order_id}: {e}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+        let Some(venue_order_id) = cmd.venue_order_id else {
+            anyhow::bail!("Cannot cancel {}: no venue order ID", cmd.client_order_id);
+        };
+
+        let http_client = self.http_client.clone();
+        let chain = self.chain.clone();
+        let client_order_id = cmd.client_order_id;
+        nautilus_common::live::runtime::get_runtime().spawn(async move {
+            let live_id = chain.lock().await.resolve(venue_order_id);
+            match http_client.cancel_order(live_id.as_str()).await {
+                Ok(()) => {
+                    chain.lock().await.forget(venue_order_id);
+                    log::debug!("Alpaca canceled {live_id} for {client_order_id}");
+                }
+                Err(e) => log::error!("Failed to cancel {client_order_id}: {e}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        // The venue cancels every open order account-wide; it has no per-symbol form, so an
+        // instrument-scoped request would cancel more than was asked.
+        log::warn!(
+            "Alpaca cancels all open orders account-wide; the {} scope on this request is ignored",
+            cmd.instrument_id
+        );
+
+        let http_client = self.http_client.clone();
+        let chain = self.chain.clone();
+        nautilus_common::live::runtime::get_runtime().spawn(async move {
+            match http_client.cancel_all_orders().await {
+                Ok(()) => {
+                    *chain.lock().await = ReplacementChain::default();
+                    log::debug!("Alpaca canceled all open orders");
+                }
+                Err(e) => log::error!("Failed to cancel all orders: {e}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
+        // No batch endpoint exists, so the cancels are issued individually.
+        for cancel in cmd.cancels {
+            self.cancel_order(cancel)?;
+        }
+        Ok(())
+    }
+
+    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        nautilus_common::live::runtime::get_runtime().spawn(async move {
+            match http_client.get_account().await {
+                Ok(account) => match Self::account_balances(&account) {
+                    Ok(balances) => {
+                        emitter.emit_account_state(
+                            balances,
+                            Vec::<MarginBalance>::new(),
+                            true,
+                            clock.get_time_ns(),
+                        );
+                    }
+                    Err(e) => log::error!("Failed to convert Alpaca account: {e}"),
+                },
+                Err(e) => log::error!("Failed to query Alpaca account: {e}"),
+            }
+        });
+        Ok(())
+    }
+
+    fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
+        let Some(venue_order_id) = cmd.venue_order_id else {
+            anyhow::bail!("Cannot query {}: no venue order ID", cmd.client_order_id);
+        };
+
+        let http_client = self.http_client.clone();
+        let chain = self.chain.clone();
+        let emitter = self.emitter.clone();
+        let account_id = self.core.account_id;
+        let clock = self.clock;
+        nautilus_common::live::runtime::get_runtime().spawn(async move {
+            let live_id = chain.lock().await.resolve(venue_order_id);
+            match http_client.get_order(live_id.as_str()).await {
+                Ok(venue_order) => {
+                    match parse_order_status_report(
+                        &venue_order,
+                        account_id,
+                        reg_nms::PRICE_PRECISION,
+                        clock.get_time_ns(),
+                    ) {
+                        Ok(report) => emitter.send_order_status_report(report),
+                        Err(e) => log::warn!("Cannot report order {live_id}: {e}"),
+                    }
+                }
+                Err(e) => log::error!("Failed to query order {live_id}: {e}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn generate_order_status_report(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let Some(venue_order_id) = cmd.venue_order_id else {
+            return Ok(None);
+        };
+        let live_id = self.live_venue_order_id(venue_order_id).await;
+        let venue_order = self.http_client.get_order(live_id.as_str()).await?;
+
+        parse_order_status_report(
+            &venue_order,
+            self.core.account_id,
+            reg_nms::PRICE_PRECISION,
+            self.clock.get_time_ns(),
+        )
+        .map(Some)
+    }
+
+    async fn generate_order_status_reports(
+        &self,
+        _cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let orders = self
+            .http_client
+            .list_orders(&ListOrdersParams::open())
+            .await?;
+
+        Ok(self.reports_from_orders(&orders))
+    }
+
+    async fn generate_fill_reports(
+        &self,
+        _cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        // Alpaca publishes fill detail on the trade update stream rather than as a REST activity
+        // this adapter reads today. Returning an empty set here would look like "no fills", so the
+        // gap is reported instead.
+        anyhow::bail!(
+            "Alpaca fill reports require the trading event stream, which is not yet implemented"
+        )
+    }
+
+    async fn generate_position_status_reports(
+        &self,
+        _cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let positions = self.http_client.list_positions().await?;
+        let ts_init = self.clock.get_time_ns();
+
+        Ok(positions
+            .iter()
+            .filter_map(|position| {
+                parse_position_status_report(position, self.core.account_id, ts_init)
+                    .inspect_err(|e| {
+                        log::warn!("Skipping Alpaca position for {}: {e}", position.symbol);
+                    })
+                    .ok()
+            })
+            .collect())
+    }
+}
+
+impl AlpacaExecutionClient {
+    /// Converts venue orders into reports, skipping any that cannot be represented.
+    ///
+    /// Orders that were superseded by a replacement are dropped rather than reported: they are not
+    /// cancelled, and the replacement carries the live state.
+    fn reports_from_orders(&self, orders: &[AlpacaOrder]) -> Vec<OrderStatusReport> {
+        let ts_init = self.clock.get_time_ns();
+        orders
+            .iter()
+            .filter(|order| !order.status.is_superseded())
+            .filter_map(|order| {
+                parse_order_status_report(
+                    order,
+                    self.core.account_id,
+                    reg_nms::PRICE_PRECISION,
+                    ts_init,
+                )
+                .inspect_err(|e| log::warn!("Skipping Alpaca order {}: {e}", order.id))
+                .ok()
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn vid(raw: &str) -> VenueOrderId {
+        VenueOrderId::new(raw)
+    }
+
+    #[rstest]
+    fn test_unknown_id_resolves_to_itself() {
+        let chain = ReplacementChain::default();
+        assert_eq!(chain.resolve(vid("A")), vid("A"));
+    }
+
+    #[rstest]
+    fn test_replacement_is_resolved() {
+        let mut chain = ReplacementChain::default();
+        chain.record(vid("A"), vid("B"));
+        assert_eq!(chain.resolve(vid("A")), vid("B"));
+    }
+
+    #[rstest]
+    fn test_repeated_amendment_collapses_rather_than_nesting() {
+        // The engine keeps addressing the original identifier, so it must reach the newest one in
+        // a single hop however many amendments have happened.
+        let mut chain = ReplacementChain::default();
+        chain.record(vid("A"), vid("B"));
+        chain.record(vid("B"), vid("C"));
+        assert_eq!(chain.resolve(vid("A")), vid("C"));
+    }
+
+    #[rstest]
+    fn test_third_amendment_still_resolves_from_the_original() {
+        let mut chain = ReplacementChain::default();
+        chain.record(vid("A"), vid("B"));
+        chain.record(vid("B"), vid("C"));
+        chain.record(vid("C"), vid("D"));
+        assert_eq!(chain.resolve(vid("A")), vid("D"));
+    }
+
+    #[rstest]
+    fn test_chains_for_different_orders_stay_separate() {
+        let mut chain = ReplacementChain::default();
+        chain.record(vid("A"), vid("B"));
+        chain.record(vid("X"), vid("Y"));
+        assert_eq!(chain.resolve(vid("A")), vid("B"));
+        assert_eq!(chain.resolve(vid("X")), vid("Y"));
+    }
+
+    #[rstest]
+    fn test_forget_drops_the_mapping() {
+        let mut chain = ReplacementChain::default();
+        chain.record(vid("A"), vid("B"));
+        chain.forget(vid("A"));
+        assert_eq!(chain.resolve(vid("A")), vid("A"));
+    }
+}

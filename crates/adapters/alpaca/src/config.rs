@@ -186,6 +186,12 @@ pub struct AlpacaExecClientConfig {
     /// Maximum retry delay in milliseconds.
     #[builder(default = 5000)]
     pub retry_delay_max_ms: u64,
+    /// Whether submitted orders may execute outside the regular session.
+    ///
+    /// Defaults to false: an order that trades pre-market or after hours does so in thinner
+    /// liquidity than the caller may expect, so extended-hours execution is opted into.
+    #[builder(default)]
+    pub default_extended_hours: bool,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
@@ -200,6 +206,7 @@ nautilus_core::impl_pyo3_config_getters!(AlpacaExecClientConfig {
     max_retries: u32,
     retry_delay_initial_ms: u64,
     retry_delay_max_ms: u64,
+    default_extended_hours: bool,
     transport_backend: TransportBackend,
 });
 

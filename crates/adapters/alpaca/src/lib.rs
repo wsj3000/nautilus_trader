@@ -52,12 +52,14 @@
 pub mod common;
 pub mod config;
 pub mod data;
+pub mod execution;
 pub mod http;
 pub mod provider;
 
 pub use crate::{
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     data::AlpacaDataClient,
+    execution::AlpacaExecutionClient,
     http::client::AlpacaRawHttpClient,
     provider::AlpacaInstrumentProvider,
 };
