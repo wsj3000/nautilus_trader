@@ -131,6 +131,8 @@ impl AlpacaInstrumentProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use nautilus_model::instruments::Instrument;
     use rstest::rstest;
 
@@ -215,25 +217,59 @@ mod tests {
         assert_eq!(provider.count(), 0);
     }
 
+    /// Builds `count` distinct assets from the fixture, so a bulk load can be measured.
+    fn many_assets(count: usize) -> Vec<Asset> {
+        let template = sample_assets()
+            .into_iter()
+            .find(|a| a.symbol == "AAPL")
+            .expect("fixture has no AAPL");
+
+        (0..count)
+            .map(|i| {
+                let mut asset = template.clone();
+                asset.symbol = format!("SYM{i}");
+                asset
+            })
+            .collect()
+    }
+
     #[rstest]
-    fn test_bulk_load_inserts_in_one_pass() {
-        // Guards the quadratic insert: `AtomicMap::insert` clones the whole map per call, so a
-        // per-asset insert makes a venue-sized load take tens of millions of clones. This asserts
-        // the batch lands, which only holds if the single-pass path is taken.
+    fn test_bulk_load_caches_every_asset() {
         let provider = provider();
-        let mut assets = Vec::new();
-        for i in 0..500 {
-            let mut asset = sample_assets()
-                .into_iter()
-                .find(|a| a.symbol == "AAPL")
-                .unwrap();
-            asset.symbol = format!("SYM{i}");
-            assets.push(asset);
-        }
+        let assets = many_assets(500);
 
         let loaded = provider.parse_and_cache(&assets, UnixNanos::from(1));
         assert_eq!(loaded.len(), 500);
         assert_eq!(provider.count(), 500);
         assert!(provider.get_by_symbol("SYM499").is_some());
+    }
+
+    #[rstest]
+    fn test_bulk_load_is_linear_in_the_number_of_assets() {
+        // `AtomicMap::insert` clones the whole map on every call, so inserting per asset makes the
+        // load quadratic. Both paths end with the same map, so nothing but elapsed time tells them
+        // apart, and an assertion on the contents cannot detect the regression.
+        //
+        // Measured on this fixture: 2,000 assets take about 70ms batched and about 17 seconds one
+        // at a time, and 4,000 take 137ms against 69 seconds. The threshold sits roughly 40x above
+        // the batched cost and 5x below the per-asset cost, which is wide enough that load on the
+        // machine cannot push either side across it.
+        const ASSETS: usize = 2_000;
+        const LIMIT: Duration = Duration::from_secs(3);
+
+        let provider = provider();
+        let assets = many_assets(ASSETS);
+
+        let start = Instant::now();
+        let loaded = provider.parse_and_cache(&assets, UnixNanos::from(1));
+        let elapsed = start.elapsed();
+
+        assert_eq!(loaded.len(), ASSETS);
+        assert_eq!(provider.count(), ASSETS);
+        assert!(
+            elapsed < LIMIT,
+            "loading {ASSETS} assets took {elapsed:?}, over the {LIMIT:?} limit: the load is no \
+             longer linear, which means instruments are being inserted one at a time again"
+        );
     }
 }

@@ -73,9 +73,14 @@ struct Recorder {
     requests: Arc<AtomicUsize>,
 }
 
+/// The activity id for a record, which is also the page token that follows it.
+fn activity_id(index: usize) -> String {
+    format!("2026062421123{index:04}::1444f6ad-0000-4000-8000-{index:012}")
+}
+
 fn activity(index: usize) -> Value {
     json!({
-        "id": format!("2026062421123{index:04}::1444f6ad-0000-4000-8000-{index:012}"),
+        "id": activity_id(index),
         "activity_type": "FILL",
         "type": "fill",
         "transaction_time": "2026-06-25T01:12:30.709802Z",
@@ -83,7 +88,10 @@ fn activity(index: usize) -> Value {
         "side": "buy",
         "price": "201.45",
         "qty": "1",
-        "order_id": format!("0000aaaa-0000-4000-8000-{index:012}"),
+        // Deliberately unrelated to the index. When this shared the id's trailing digits, a cursor
+        // built from `order_id` decoded to the same page as one built from `id`, so the mock and
+        // the client agreed while both were reading the wrong field.
+        "order_id": format!("0000aaaa-0000-4000-8000-{:012}", 900_000 - index),
         "cum_qty": "1",
         "leaves_qty": "0",
         "order_status": "filled",
@@ -114,12 +122,13 @@ async fn start_server(total: usize, recorder: Recorder) -> SocketAddr {
                     .push((query.after.clone(), query.until.clone()));
 
                 let size = query.page_size.unwrap_or(PAGE_SIZE);
-                // The cursor is the previous page's last `id`, whose trailing digits are its index.
+                // The cursor must be the previous page's `id` exactly. Resolving it by lookup
+                // rather than by decoding digits means a token taken from any other field finds
+                // no record and pages from the start, which the tests then catch as a duplicate.
                 let start = match query.page_token {
-                    Some(token) => {
-                        let suffix = token.rsplit('-').next().unwrap_or_default();
-                        suffix.parse::<usize>().unwrap_or_default() + 1
-                    }
+                    Some(token) => (0..total)
+                        .find(|i| activity_id(*i) == token)
+                        .map_or(0, |i| i + 1),
                     None => 0,
                 };
                 let end = total.min(start + size);
@@ -163,9 +172,13 @@ async fn test_activities_paging_follows_the_cursor_across_pages() {
     // Three requests: two full pages and a short one that ends the walk.
     assert_eq!(recorder.requests.load(Ordering::SeqCst), 3);
 
+    // Assert the cursor's exact value, not merely that one was sent. Checking only for presence
+    // let a cursor built from the neighbouring `order_id` pass, because both fields once ended in
+    // the same digits.
     let tokens = recorder.tokens.lock().unwrap().clone();
     assert_eq!(tokens[0], None, "the first request carries no cursor");
-    assert!(tokens[1].is_some() && tokens[2].is_some());
+    assert_eq!(tokens[1], Some(activity_id(99)));
+    assert_eq!(tokens[2], Some(activity_id(199)));
 
     // Every fill is distinct: a mis-threaded cursor would repeat a page.
     let ids: std::collections::HashSet<_> = activities.iter().map(|a| a.id.as_str()).collect();
