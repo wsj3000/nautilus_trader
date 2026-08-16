@@ -1,0 +1,92 @@
+[
+  {
+    "stream": "authorization",
+    "data": {
+      "status": "authorized",
+      "action": "authenticate"
+    }
+  },
+  {
+    "stream": "listening",
+    "data": {
+      "streams": [
+        "trade_updates"
+      ]
+    }
+  },
+  {
+    "stream": "trade_updates",
+    "data": {
+      "event": "accepted",
+      "timestamp": "2026-08-16T01:40:00.000000Z",
+      "order": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "client_order_id": "nautilus-capture-1",
+        "symbol": "AAPL",
+        "asset_class": "us_equity",
+        "order_type": "limit",
+        "type": "limit",
+        "side": "buy",
+        "time_in_force": "gtc",
+        "status": "accepted",
+        "qty": "1",
+        "filled_qty": "0",
+        "limit_price": "1",
+        "extended_hours": false,
+        "order_class": ""
+      }
+    }
+  },
+  {
+    "stream": "trade_updates",
+    "data": {
+      "event": "canceled",
+      "timestamp": "2026-08-16T01:40:05.000000Z",
+      "order": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "client_order_id": "nautilus-capture-1",
+        "symbol": "AAPL",
+        "asset_class": "us_equity",
+        "order_type": "limit",
+        "type": "limit",
+        "side": "buy",
+        "time_in_force": "gtc",
+        "status": "canceled",
+        "qty": "1",
+        "filled_qty": "0",
+        "limit_price": "1",
+        "canceled_at": "2026-08-16T01:40:05.000000Z",
+        "extended_hours": false,
+        "order_class": ""
+      }
+    }
+  },
+  {
+    "stream": "trade_updates",
+    "data": {
+      "event": "fill",
+      "timestamp": "2026-08-14T14:30:05.123456Z",
+      "price": "300.005",
+      "qty": "10",
+      "position_qty": "10",
+      "execution_id": "00000000-0000-4000-8000-00000000000e",
+      "order": {
+        "id": "00000000-0000-4000-8000-000000000002",
+        "client_order_id": "nautilus-capture-2",
+        "symbol": "AAPL",
+        "asset_class": "us_equity",
+        "order_type": "limit",
+        "type": "limit",
+        "side": "buy",
+        "time_in_force": "day",
+        "status": "filled",
+        "qty": "10",
+        "filled_qty": "10",
+        "filled_avg_price": "300.005",
+        "limit_price": "300.01",
+        "extended_hours": false,
+        "order_class": ""
+      }
+    }
+  }
+]

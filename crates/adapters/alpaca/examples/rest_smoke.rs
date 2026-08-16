@@ -33,7 +33,16 @@ use nautilus_alpaca::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = AlpacaRawHttpClient::from_env(AlpacaEnvironment::Paper)?;
+    let mut client = AlpacaRawHttpClient::from_env(AlpacaEnvironment::Paper)?;
+
+    // Setting these points the adapter at a local proxy instead of the venue. The request path is
+    // otherwise identical, which is what makes the proxy swappable.
+    if let Ok(base) = std::env::var("ALPACA_PROXY_URL") {
+        println!("routing through proxy at {base}");
+        client.set_trading_base_url(base.clone());
+        client.set_data_base_url(base);
+    }
+
     println!(
         "client constructed, credentials present: {}",
         client.has_credentials()

@@ -272,6 +272,9 @@ impl AlpacaDataClient {
         if let Some(url) = config.base_url_rest.clone() {
             http_client.set_data_base_url(url);
         }
+        if let Some(url) = config.base_url_trading.clone() {
+            http_client.set_trading_base_url(url);
+        }
 
         let http_client = Arc::new(http_client);
         let provider = AlpacaInstrumentProvider::new(http_client.clone());

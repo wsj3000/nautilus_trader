@@ -49,10 +49,18 @@ const LISTEN_WINDOW: Duration = Duration::from_secs(12);
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let credential = AlpacaCredential::from_env()?;
-    let client = AlpacaRawHttpClient::from_env(AlpacaEnvironment::Paper)?;
+    let mut client = AlpacaRawHttpClient::from_env(AlpacaEnvironment::Paper)?;
+    let proxy = std::env::var("ALPACA_PROXY_URL").ok();
+    if let Some(base) = proxy.clone() {
+        println!("routing REST through proxy at {base}");
+        client.set_trading_base_url(base.clone());
+        client.set_data_base_url(base);
+    }
+    let stream_url = std::env::var("ALPACA_PROXY_WS").ok();
 
     println!("connecting to the trading event stream");
-    let mut stream = connect_trading_stream(AlpacaEnvironment::Paper, &credential, None).await?;
+    let mut stream =
+        connect_trading_stream(AlpacaEnvironment::Paper, &credential, stream_url).await?;
     println!("handshake complete: {stream:?}");
 
     let client_order_id = format!("nautilus-capture-{}", std::process::id());

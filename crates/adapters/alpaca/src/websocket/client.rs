@@ -306,4 +306,51 @@ mod tests {
         let frame = r#"{"stream":"trade_updates","data":{"event":"fill"}}"#;
         assert!(parse_trade_update(frame).is_err());
     }
+
+    const FRAMES_JSON: &str = include_str!("../../test_data/ws_trade_updates.json");
+
+    fn frames() -> Vec<String> {
+        serde_json::from_str::<Vec<serde_json::Value>>(FRAMES_JSON)
+            .unwrap()
+            .into_iter()
+            .map(|frame| frame.to_string())
+            .collect()
+    }
+
+    #[rstest]
+    fn test_captured_frames_route_correctly() {
+        // Frames captured from a live paper session: the handshake pair must be skipped and the
+        // three trade updates must decode.
+        let count = frames()
+            .iter()
+            .filter_map(|frame| parse_trade_update(frame).unwrap())
+            .count();
+        assert_eq!(count, 3);
+    }
+
+    #[rstest]
+    fn test_captured_accepted_event_is_modelled() {
+        // This event was `Unknown` until a live capture named it.
+        let updates: Vec<_> = frames()
+            .iter()
+            .filter_map(|frame| parse_trade_update(frame).unwrap())
+            .collect();
+        assert_eq!(updates[0].event, "accepted");
+        assert_eq!(updates[0].event_kind(), AlpacaTradeEvent::Accepted);
+        assert!(updates[0].event_kind().is_working());
+    }
+
+    #[rstest]
+    fn test_captured_cancel_and_fill() {
+        let updates: Vec<_> = frames()
+            .iter()
+            .filter_map(|frame| parse_trade_update(frame).unwrap())
+            .collect();
+        assert_eq!(updates[1].event_kind(), AlpacaTradeEvent::Canceled);
+        assert!(!updates[1].has_fill_detail());
+
+        assert_eq!(updates[2].event_kind(), AlpacaTradeEvent::Fill);
+        assert!(updates[2].has_fill_detail());
+        assert_eq!(updates[2].price.as_deref(), Some("300.005"));
+    }
 }

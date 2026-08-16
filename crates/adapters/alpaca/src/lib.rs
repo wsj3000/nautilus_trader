@@ -53,14 +53,19 @@ pub mod common;
 pub mod config;
 pub mod data;
 pub mod execution;
+pub mod factories;
 pub mod http;
 pub mod provider;
+
+#[cfg(feature = "python")]
+pub mod python;
 pub mod websocket;
 
 pub use crate::{
     config::{AlpacaDataClientConfig, AlpacaExecClientConfig},
     data::AlpacaDataClient,
     execution::AlpacaExecutionClient,
+    factories::{AlpacaDataClientFactory, AlpacaExecutionClientFactory},
     http::client::AlpacaRawHttpClient,
     provider::AlpacaInstrumentProvider,
 };

@@ -47,7 +47,12 @@ const SYMBOL: &str = "AAPL";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Paper only: this example submits live orders, and pointing it at the live environment would
     // transact real capital.
-    let client = AlpacaRawHttpClient::from_env(AlpacaEnvironment::Paper)?;
+    let mut client = AlpacaRawHttpClient::from_env(AlpacaEnvironment::Paper)?;
+    if let Ok(base) = std::env::var("ALPACA_PROXY_URL") {
+        println!("routing through proxy at {base}");
+        client.set_trading_base_url(base.clone());
+        client.set_data_base_url(base);
+    }
 
     let account = client.get_account().await?;
     println!(
@@ -64,9 +69,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Unique per run: the venue rejects a repeated client order ID, so a fixed one only works
+    // once per account.
     let client_order_id = format!(
-        "nautilus-smoke-{}",
-        account.id.split('-').next().unwrap_or("x")
+        "nautilus-smoke-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
     );
     let request = SubmitOrderRequest {
         symbol: SYMBOL.to_string(),

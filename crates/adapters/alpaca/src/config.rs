@@ -41,6 +41,12 @@ pub struct AlpacaDataClientConfig {
     pub api_secret: Option<String>,
     /// Override for the Market Data API base URL.
     pub base_url_rest: Option<String>,
+    /// Override for the Trading API base URL.
+    ///
+    /// The data client reaches the Trading API too, for the instrument list and the calendar, so
+    /// that host is overridable independently of the market data one. Both are needed to point
+    /// the client at a local proxy.
+    pub base_url_trading: Option<String>,
     /// Override for the market data WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
@@ -91,6 +97,7 @@ pub struct AlpacaDataClientConfig {
 #[cfg(feature = "python")]
 nautilus_core::impl_pyo3_config_getters!(AlpacaDataClientConfig {
     base_url_rest: Option<String>,
+    base_url_trading: Option<String>,
     base_url_ws: Option<String>,
     environment: AlpacaEnvironment,
     feed: AlpacaDataFeed,
@@ -130,13 +137,15 @@ impl AlpacaDataClientConfig {
             .unwrap_or_else(|| urls::data_rest_url().to_string())
     }
 
-    /// Returns the Trading API base URL, respecting environment.
+    /// Returns the Trading API base URL, respecting environment and overrides.
     ///
     /// Instrument metadata is served by the Trading API rather than the Market Data API, so
     /// the data client needs both hosts.
     #[must_use]
     pub fn trading_rest_url(&self) -> String {
-        urls::trading_rest_url(self.environment).to_string()
+        self.base_url_trading
+            .clone()
+            .unwrap_or_else(|| urls::trading_rest_url(self.environment).to_string())
     }
 
     /// Returns the market data WebSocket URL, respecting feed and overrides.
