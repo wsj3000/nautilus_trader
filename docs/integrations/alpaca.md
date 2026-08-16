@@ -192,9 +192,22 @@ always a 36-character UUID, unique per fill, and the same shape the event stream
 `execution_id`. An identifier with no part short enough is refused rather than truncated, since
 truncation could collide with another execution.
 
-Whether that UUID is the *same value* the stream reports has not been confirmed; it needs one fill
-observed on both paths, which needs an open market. If it matches, a recovered fill and the live
-one de-duplicate to a single trade; if not, one execution would reach the engine as two.
+Whether that UUID is the *same value* the stream reports has not been confirmed. The engine
+de-duplicates fills by trade identifier, so if it matches, a recovered fill and the live one
+resolve to a single trade; if not, one execution reaches the engine as two and the position is
+silently wrong. The paths overlap only where a fill lands between the activity fetch and the
+stream subscription during startup, which is narrow but not never.
+
+Settling it needs one execution observed on both paths, so it needs an open session:
+
+```bash
+cargo run -p nautilus-alpaca --example execution_id_check -- --run
+```
+
+It buys one share at market in the paper account, reads the fill from the stream and again from
+the activity feed, and compares. It exits 0 on a match, 1 on a mismatch, and **2 when it could not
+get a fill** — a closed market reports inconclusive rather than passing, since a check that goes
+green without testing anything is worse than no check.
 
 ### Order reports
 
