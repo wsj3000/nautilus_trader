@@ -58,6 +58,10 @@ ustr = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# The conformance example fetches raw JSON, deliberately bypassing the adapter's typed client:
+# comparing a parsed-and-reserialized model against the fixtures could only ever detect drift
+# between the model and the fixture, never between the fixture and the venue.
+reqwest = { workspace = true }
 rstest = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
