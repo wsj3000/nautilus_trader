@@ -309,7 +309,9 @@ pub fn parse_fill_activity_report(
         VenueOrderId::new(activity.order_id.as_str()),
         TradeId::new(extract_execution_id(&activity.id)?),
         activity.side.to_nautilus()?,
-        parse_quantity(activity.cum_qty.as_deref().unwrap_or(&activity.qty), "qty")?,
+        // `qty` is this execution's own quantity. `cum_qty` is the order's running total, so
+        // reading it would count every earlier execution again on each subsequent fill.
+        parse_quantity(&activity.qty, "qty")?,
         parse_price(&activity.price, "price", price_precision)?,
         // The venue reports no commission on this feed and US equity trading there is
         // commission-free; inventing a figure would corrupt realised PnL.
