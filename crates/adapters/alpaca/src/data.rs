@@ -277,7 +277,8 @@ impl AlpacaDataClient {
         }
 
         let http_client = Arc::new(http_client);
-        let provider = AlpacaInstrumentProvider::new(http_client.clone());
+        let provider =
+            AlpacaInstrumentProvider::from_config(http_client.clone(), &config.instrument_provider);
 
         Ok(Self {
             client_id,

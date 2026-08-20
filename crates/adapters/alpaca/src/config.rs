@@ -23,6 +23,34 @@ use crate::common::{
     urls,
 };
 
+/// Configuration for which Alpaca instruments are loaded on startup.
+///
+/// The venue lists roughly 13,000 tradable US equities, and loading them all costs about 93 MB
+/// resident: once in the provider's cache and once in the engine's, at roughly 3.5 KB each. A node
+/// that trades a handful of symbols pays that for instruments it never looks at, so the set is
+/// narrowable.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlpacaInstrumentProviderConfig {
+    /// Whether to load every tradable US equity on startup.
+    ///
+    /// Defaults to true, which is what a node needs when it does not know in advance which
+    /// instruments it will trade.
+    #[builder(default = true)]
+    pub load_all: bool,
+    /// Instrument IDs to load when `load_all` is false.
+    ///
+    /// Anything not listed is skipped before it is parsed, so an excluded instrument costs
+    /// nothing beyond the bytes the venue already sent.
+    pub load_ids: Option<Vec<String>>,
+}
+
+impl Default for AlpacaInstrumentProviderConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// Configuration for the Alpaca data client.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
@@ -79,6 +107,9 @@ pub struct AlpacaDataClientConfig {
     /// source of holidays.
     #[builder(default = 14)]
     pub calendar_lookahead_days: u32,
+    /// Which instruments to load on startup.
+    #[builder(default)]
+    pub instrument_provider: AlpacaInstrumentProviderConfig,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     ///
     /// Unused while market data is polled over REST; retained for the WebSocket transport.

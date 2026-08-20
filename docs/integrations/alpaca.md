@@ -106,6 +106,49 @@ expressible as a single increment and is enforced at order submission instead.
 Assets are loaded only when both `status` is `active` **and** `tradable` is true; the two are
 independent.
 
+### Narrowing what is loaded
+
+The venue lists roughly 13,400 tradable US equities and the adapter loads them all by default,
+because a node cannot generally know in advance what it will trade. That costs about **93 MB
+resident**, held twice — once in the provider's cache and once in the engine's — at roughly 3.5 KB
+each. Measured on a node subscribing to a single bar type, it is 76% of the process:
+
+| | RSS |
+| --- | ---: |
+| Before the instrument load | 28 MB |
+| After loading 13,392 instruments | 121 MB |
+| After reconciling 350 events | 123 MB |
+
+A node that knows its instruments can name them:
+
+```rust
+AlpacaDataClientConfig {
+    instrument_provider: AlpacaInstrumentProviderConfig {
+        load_all: false,
+        load_ids: Some(vec!["AAPL.ALPACA".to_string()]),
+    },
+    ..Default::default()
+}
+```
+
+Selection happens before the asset is parsed, so an excluded instrument costs nothing beyond the
+bytes the venue already sent.
+
+**Instruments the account holds, or has working orders against, are loaded whether or not they are
+listed.** Reconciliation reads positions and orders for the whole account rather than only for what
+this node trades, and it skips any whose instrument is absent from the cache. Without this, a
+narrowed load left the engine reporting a held position as flat — `Position discrepancy detected
+for NVDA.ALPACA: cached_signed_qty=0, venue_signed_qty=4` — while 341 orders were skipped. Reading
+positions or orders is best-effort: a failure is logged and the load continues, because fewer
+instruments is recoverable and none is not.
+
+Two things still need care. **Subscribing to an instrument that was not loaded is refused**, since
+the data client checks the provider's cache first, so the list has to cover everything the node
+subscribes to including anything a strategy adds later. And `load_all = false` with an empty or
+entirely invalid `load_ids` loads nothing beyond what the account holds, and logs a warning, rather
+than falling back to loading everything — a silent fallback would restore the cost the setting
+exists to avoid. An individually malformed ID is logged and skipped; the rest still load.
+
 ### Overnight eligibility
 
 Asset attributes carry overnight eligibility, and they are independent of one another:
