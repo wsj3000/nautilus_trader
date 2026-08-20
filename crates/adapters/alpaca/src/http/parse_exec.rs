@@ -261,11 +261,15 @@ pub fn parse_fill_report(
 /// 36-character UUID, unique per fill, which is both what fits and the same shape the trading
 /// event stream reports as `execution_id`.
 ///
-/// Whether the two are the *same* value has not been confirmed — doing so needs one fill observed
-/// on the stream and again in the activity feed, which needs an open market. If they match, a fill
-/// recovered here and the same fill seen live resolve to one trade identifier; if they do not, the
-/// engine would see two trades for one execution, so it is worth confirming before this path
-/// carries real positions.
+/// The two are the same value, confirmed on 2026-08-20 by observing one execution on both paths:
+/// the stream reported `c27c5376-c4eb-414c-ba5a-4fb21d0b4c87` and the activity feed
+/// `20260820050934216::c27c5376-c4eb-414c-ba5a-4fb21d0b4c87`. A fill recovered here and the same
+/// fill seen live therefore resolve to one trade identifier, which is what lets the engine
+/// de-duplicate them. `examples/execution_id_check.rs` re-runs that check.
+///
+/// Note that only a *fill* event carries the execution identifier this matches. Lifecycle events
+/// carry an `execution_id` too — `new` has one, and it is unrelated — so anything comparing these
+/// has to gate on `has_fill_detail` first, as `parse_fill_report` does.
 ///
 /// # Errors
 ///

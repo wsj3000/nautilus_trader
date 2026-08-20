@@ -235,13 +235,17 @@ always a 36-character UUID, unique per fill, and the same shape the event stream
 `execution_id`. An identifier with no part short enough is refused rather than truncated, since
 truncation could collide with another execution.
 
-Whether that UUID is the *same value* the stream reports has not been confirmed. The engine
-de-duplicates fills by trade identifier, so if it matches, a recovered fill and the live one
-resolve to a single trade; if not, one execution reaches the engine as two and the position is
-silently wrong. The paths overlap only where a fill lands between the activity fetch and the
-stream subscription during startup, which is narrow but not never.
+That UUID **is** the value the stream reports, confirmed on 2026-08-20 by observing one execution
+on both paths: the stream gave `c27c5376-c4eb-414c-ba5a-4fb21d0b4c87` and the activity feed
+`20260820050934216::c27c5376-c4eb-414c-ba5a-4fb21d0b4c87`. The engine de-duplicates fills by trade
+identifier, so a fill recovered at startup and the same fill seen live resolve to a single trade.
 
-Settling it needs one execution observed on both paths, so it needs an open session:
+Only a **fill** event carries that identifier. Lifecycle events have an `execution_id` too — `new`
+has one, unrelated to any execution — so `parse_fill_report` gates on `has_fill_detail` before
+reading it. The first version of the check below did not, compared an acknowledgement's identifier
+against an execution's, and reported a mismatch that was its own.
+
+To re-run it:
 
 ```bash
 cargo run -p nautilus-alpaca --example execution_id_check -- --run
