@@ -622,7 +622,13 @@ impl DataClient for AlpacaDataClient {
                     let mut bars = Vec::new();
                     for venue_bar in bars_by_symbol.get(&symbol).into_iter().flatten() {
                         match parse_bar(venue_bar, bar_type, price_precision, ts_init) {
-                            Ok(bar) => bars.push(bar),
+                            Ok(mut bar) => {
+                                // Historical data is initialized at its event time. Stamping every
+                                // row with the response-arrival time puts `ts_init` just beyond the
+                                // requested end and makes the data engine trim the whole response.
+                                bar.ts_init = bar.ts_event;
+                                bars.push(bar);
+                            }
                             Err(e) => log::warn!("Skipping malformed Alpaca bar: {e}"),
                         }
                     }
@@ -779,6 +785,7 @@ mod tests {
         assert_eq!(response.bar_type, minute("AAPL"));
         assert_eq!(response.data.len(), 2);
         assert!(response.data[0].ts_event < response.data[1].ts_event);
+        assert!(response.data.iter().all(|bar| bar.ts_init == bar.ts_event));
         assert_eq!(response.start, datetime_to_unix_nanos(Some(start)));
         assert_eq!(response.end, datetime_to_unix_nanos(Some(end)));
 
