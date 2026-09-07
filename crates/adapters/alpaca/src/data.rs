@@ -54,9 +54,9 @@ use nautilus_common::{
     clients::DataClient,
     live::{runner::get_data_event_sender, runtime::get_runtime},
     messages::{
-        DataEvent,
+        DataEvent, DataResponse,
         data::{
-            RequestBars, RequestInstruments, SubscribeBars, SubscribeBookDeltas,
+            BarsResponse, RequestBars, RequestInstruments, SubscribeBars, SubscribeBookDeltas,
             SubscribeBookDepth10, SubscribeInstrumentStatus, SubscribeInstruments, SubscribeQuotes,
             SubscribeTrades, UnsubscribeBars, UnsubscribeInstruments,
         },
@@ -64,6 +64,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     UnixNanos,
+    datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
@@ -597,6 +598,11 @@ impl DataClient for AlpacaDataClient {
         let clock = self.clock;
         let feed = self.current_feed();
         let price_precision = crate::common::reg_nms::PRICE_PRECISION;
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let response_start = datetime_to_unix_nanos(request.start);
+        let response_end = datetime_to_unix_nanos(request.end);
+        let response_params = request.params;
 
         let mut params = BarsParams::new(std::slice::from_ref(&symbol), timeframe).with_feed(feed);
         if let Some(start) = request.start {
@@ -613,20 +619,27 @@ impl DataClient for AlpacaDataClient {
             match http_client.get_bars_all_pages(&params, MAX_BAR_PAGES).await {
                 Ok(bars_by_symbol) => {
                     let ts_init = clock.get_time_ns();
-                    let Some(venue_bars) = bars_by_symbol.get(&symbol) else {
-                        log::debug!("No Alpaca bars returned for {symbol}");
-                        return;
-                    };
-                    for venue_bar in venue_bars {
+                    let mut bars = Vec::new();
+                    for venue_bar in bars_by_symbol.get(&symbol).into_iter().flatten() {
                         match parse_bar(venue_bar, bar_type, price_precision, ts_init) {
-                            Ok(bar) => {
-                                if let Err(e) = data_sender.send(DataEvent::Data(Data::Bar(bar))) {
-                                    log::error!("Failed to dispatch Alpaca bar: {e}");
-                                    return;
-                                }
-                            }
+                            Ok(bar) => bars.push(bar),
                             Err(e) => log::warn!("Skipping malformed Alpaca bar: {e}"),
                         }
+                    }
+                    bars.sort_by_key(|bar| bar.ts_event);
+
+                    let response = DataResponse::Bars(BarsResponse::new(
+                        request_id,
+                        client_id,
+                        bar_type,
+                        bars,
+                        response_start,
+                        response_end,
+                        ts_init,
+                        response_params,
+                    ));
+                    if let Err(e) = data_sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send Alpaca bars response: {e}");
                     }
                 }
                 Err(e) => log::error!("Alpaca historical bars request failed: {e}"),
@@ -639,14 +652,74 @@ impl DataClient for AlpacaDataClient {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        net::SocketAddr,
+        num::NonZeroUsize,
+        sync::{Arc, Mutex as StdMutex},
+        time::Duration,
+    };
+
+    use axum::{Router, extract::Query, response::Json, routing::get};
+    use nautilus_common::live::runner::replace_data_event_sender;
+    use nautilus_core::UUID4;
     use nautilus_model::{
         data::BarSpecification,
         enums::{AggregationSource, BarAggregation, PriceType},
     };
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
-    use crate::http::parse::instrument_id;
+    use crate::{common::consts::ALPACA_CLIENT_ID, http::parse::instrument_id};
+
+    async fn start_bars_server(queries: Arc<StdMutex<Vec<HashMap<String, String>>>>) -> SocketAddr {
+        let router = Router::new().route(
+            "/v2/stocks/bars",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let queries = queries.clone();
+                async move {
+                    queries.lock().unwrap().push(query);
+                    Json(json!({
+                        "bars": {
+                            "AAPL": [
+                                {
+                                    "c": 304.885,
+                                    "h": 304.9,
+                                    "l": 304.66,
+                                    "n": 2984,
+                                    "o": 304.83,
+                                    "t": "2026-08-14T14:31:00Z",
+                                    "v": 67160,
+                                    "vw": 304.754572
+                                },
+                                {
+                                    "c": 304.82,
+                                    "h": 305.1,
+                                    "l": 304.81,
+                                    "n": 2430,
+                                    "o": 305.02,
+                                    "t": "2026-08-14T14:30:00Z",
+                                    "v": 49952,
+                                    "vw": 304.945204
+                                }
+                            ]
+                        },
+                        "next_page_token": null
+                    }))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .unwrap();
+        });
+        addr
+    }
 
     fn bar_type(symbol: &str, step: usize, aggregation: BarAggregation) -> BarType {
         BarType::new(
@@ -658,6 +731,65 @@ mod tests {
 
     fn minute(symbol: &str) -> BarType {
         bar_type(symbol, 1, BarAggregation::Minute)
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_historical_bars_are_returned_as_a_correlated_response() {
+        let queries = Arc::new(StdMutex::new(Vec::new()));
+        let addr = start_bars_server(queries.clone()).await;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+
+        let config = AlpacaDataClientConfig {
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("test-secret".to_string()),
+            base_url_rest: Some(format!("http://{addr}")),
+            ..Default::default()
+        };
+        let client = AlpacaDataClient::new(*ALPACA_CLIENT_ID, config).unwrap();
+
+        let request_id = UUID4::new();
+        let response_client_id = ClientId::from("WARMUP");
+        let start = "2026-08-14T14:29:00Z".parse().unwrap();
+        let end = "2026-08-14T14:32:00Z".parse().unwrap();
+        client
+            .request_bars(RequestBars::new(
+                minute("AAPL"),
+                Some(start),
+                Some(end),
+                Some(NonZeroUsize::new(2).unwrap()),
+                Some(response_client_id),
+                request_id,
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("timeout waiting for Alpaca bars response")
+            .expect("data channel closed");
+        let DataEvent::Response(DataResponse::Bars(response)) = event else {
+            panic!("expected a correlated bars response");
+        };
+
+        assert_eq!(response.correlation_id, request_id);
+        assert_eq!(response.client_id, response_client_id);
+        assert_eq!(response.bar_type, minute("AAPL"));
+        assert_eq!(response.data.len(), 2);
+        assert!(response.data[0].ts_event < response.data[1].ts_event);
+        assert_eq!(response.start, datetime_to_unix_nanos(Some(start)));
+        assert_eq!(response.end, datetime_to_unix_nanos(Some(end)));
+
+        let queries = queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].get("symbols").map(String::as_str), Some("AAPL"));
+        assert_eq!(
+            queries[0].get("timeframe").map(String::as_str),
+            Some("1Min")
+        );
+        assert_eq!(queries[0].get("limit").map(String::as_str), Some("2"));
     }
 
     #[rstest]
