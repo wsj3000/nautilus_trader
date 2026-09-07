@@ -958,6 +958,8 @@ mod serial_tests {
         adapter
             .update_strategy(&strategy_id, &strategy_state)
             .unwrap();
+        assert_eq!(adapter.load_actor(&actor_id).unwrap(), actor_state);
+        assert_eq!(adapter.load_strategy(&strategy_id).unwrap(), strategy_state);
 
         adapter.snapshot_order_state(&order_1).unwrap();
         adapter

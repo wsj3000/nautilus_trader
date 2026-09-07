@@ -1274,7 +1274,20 @@ impl RedisCacheDatabaseAdapter {
 
     fn update_state(&self, key: String, state: &AHashMap<String, Bytes>) -> anyhow::Result<()> {
         let payload = DatabaseQueries::serialize_payload(self.encoding(), state)?;
-        self.database.insert(key, Some(vec![Bytes::from(payload)]))
+        let mut con = self.database.con.clone();
+        let full_key = format!("{}{REDIS_DELIMITER}{key}", self.database.trader_key);
+        let (tx, rx) = mpsc::channel();
+
+        get_runtime().spawn(async move {
+            let result = con.set::<_, _, ()>(full_key, payload).await;
+            if let Err(e) = tx.send(result) {
+                log::error!("Failed to send state update result for '{key}': {e:?}");
+            }
+        });
+
+        blocking_recv(&rx)
+            .map_err(|e| anyhow::anyhow!("update_state channel closed: {e}"))?
+            .map_err(Into::into)
     }
 
     fn replace_list(&self, key: String, payload: Bytes) -> anyhow::Result<()> {
