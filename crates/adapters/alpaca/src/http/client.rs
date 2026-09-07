@@ -51,8 +51,8 @@ use crate::{
         },
         query::{
             ACTIVITIES_MAX_PAGE_SIZE, ActivitiesParams, BarsParams, CalendarParams,
-            ListAssetsParams, ListOrdersParams, ORDERS_MAX_PAGE_SIZE, ReplaceOrderRequest,
-            SubmitOrderRequest,
+            ListAssetsParams, ListOrdersParams, ORDERS_MAX_PAGE_SIZE, OrderByClientIdParams,
+            ReplaceOrderRequest, SubmitOrderRequest,
         },
     },
 };
@@ -500,6 +500,22 @@ impl AlpacaRawHttpClient {
         self.require_credentials()?;
         let path = format!("{REST_TRADING_PATH}/orders/{venue_order_id}");
         self.send_request(Method::GET, ApiTarget::Trading, &path, None, None)
+            .await
+    }
+
+    /// Requests a single order by its client-assigned identifier.
+    ///
+    /// This endpoint is the idempotent recovery path when a submission response is lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the query cannot be encoded, or the request
+    /// fails.
+    pub async fn get_order_by_client_order_id(&self, client_order_id: &str) -> Result<AlpacaOrder> {
+        self.require_credentials()?;
+        let path = format!("{REST_TRADING_PATH}/orders:by_client_order_id");
+        let query = Self::encode_query(&OrderByClientIdParams::new(client_order_id))?;
+        self.send_request(Method::GET, ApiTarget::Trading, &path, query, None)
             .await
     }
 

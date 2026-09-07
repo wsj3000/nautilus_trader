@@ -85,6 +85,23 @@ pub struct SubmitOrderRequest {
     pub extended_hours: bool,
 }
 
+/// Query parameters for `GET /v2/orders:by_client_order_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrderByClientIdParams {
+    /// Client-assigned order identifier.
+    pub client_order_id: String,
+}
+
+impl OrderByClientIdParams {
+    /// Creates a query for one client-assigned order identifier.
+    #[must_use]
+    pub fn new(client_order_id: impl Into<String>) -> Self {
+        Self {
+            client_order_id: client_order_id.into(),
+        }
+    }
+}
+
 /// Request body for `PATCH /v2/orders/{id}`.
 ///
 /// The venue treats an amendment as a replacement: it answers with a new order carrying a new

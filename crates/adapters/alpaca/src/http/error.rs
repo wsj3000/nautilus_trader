@@ -137,6 +137,18 @@ impl Error {
             Self::Transport(_) | Self::Timeout | Self::RateLimit { .. } | Self::Venue(_)
         )
     }
+
+    /// Returns true when a failed order submission is known not to have been accepted.
+    ///
+    /// Transport failures, timeouts, server failures and response decoding failures are
+    /// ambiguous: the venue may have created the order before the client lost the response.
+    #[must_use]
+    pub const fn is_definitive_submission_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::Auth(_) | Self::BadRequest(_) | Self::RateLimit { .. }
+        ) || matches!(self, Self::Http { status, .. } if *status >= 400 && *status < 500)
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +215,22 @@ mod tests {
         assert!(!Error::bad_request("422").is_retryable());
         assert!(!Error::decode("bad json").is_retryable());
         assert!(!Error::http(418, "teapot").is_retryable());
+    }
+
+    #[rstest]
+    fn test_definitive_submission_rejections() {
+        assert!(Error::auth("401").is_definitive_submission_rejection());
+        assert!(Error::bad_request("422").is_definitive_submission_rejection());
+        assert!(Error::rate_limit(None).is_definitive_submission_rejection());
+        assert!(Error::http(409, "duplicate").is_definitive_submission_rejection());
+    }
+
+    #[rstest]
+    fn test_ambiguous_submission_failures() {
+        assert!(!Error::Timeout.is_definitive_submission_rejection());
+        assert!(!Error::transport("reset").is_definitive_submission_rejection());
+        assert!(!Error::venue("500").is_definitive_submission_rejection());
+        assert!(!Error::decode("invalid success response").is_definitive_submission_rejection());
     }
 
     #[rstest]

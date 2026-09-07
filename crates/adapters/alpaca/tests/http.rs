@@ -62,6 +62,11 @@ struct OrdersQuery {
     until: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClientOrderQuery {
+    client_order_id: String,
+}
+
 /// The `after` and `until` bounds one request carried.
 type Window = (Option<String>, Option<String>);
 
@@ -155,6 +160,46 @@ fn client(addr: SocketAddr) -> AlpacaRawHttpClient {
             .unwrap();
     client.set_trading_base_url(format!("http://{addr}"));
     client
+}
+
+async fn start_client_order_server(seen: Arc<Mutex<Vec<String>>>) -> SocketAddr {
+    let router = Router::new().route(
+        "/v2/orders:by_client_order_id",
+        get(move |Query(query): Query<ClientOrderQuery>| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(query.client_order_id);
+                Json(order(7))
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_order_by_client_order_id_encodes_the_query() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let addr = start_client_order_server(seen.clone()).await;
+
+    let result = client(addr)
+        .get_order_by_client_order_id("mn-order/with reserved?characters")
+        .await
+        .unwrap();
+
+    assert_eq!(result.client_order_id, "C-7");
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["mn-order/with reserved?characters"]
+    );
 }
 
 #[rstest]

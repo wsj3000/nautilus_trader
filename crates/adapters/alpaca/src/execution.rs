@@ -558,6 +558,7 @@ impl ExecutionClient for AlpacaExecutionClient {
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let client_order_id = cmd.client_order_id;
         nautilus_common::live::runtime::get_runtime().spawn(async move {
             match http_client.submit_order(&request).await {
                 Ok(venue_order) => {
@@ -572,8 +573,51 @@ impl ExecutionClient for AlpacaExecutionClient {
                         clock.get_time_ns(),
                     );
                 }
-                Err(e) => {
-                    emitter.emit_order_rejected(&order, &e.to_string(), clock.get_time_ns(), false);
+                Err(submit_error) => {
+                    // A timed out or broken POST may still have created the order, and even a
+                    // duplicate-ID response can refer to one created by an earlier attempt.
+                    // Querying by the caller-supplied stable ID is safe; replaying the POST is not.
+                    match http_client
+                        .get_order_by_client_order_id(client_order_id.as_str())
+                        .await
+                    {
+                        Ok(venue_order)
+                            if venue_order.client_order_id == client_order_id.as_str() =>
+                        {
+                            log::warn!(
+                                "Recovered ambiguously submitted Alpaca order {} as {} after: {submit_error}",
+                                venue_order.client_order_id, venue_order.id,
+                            );
+                            emitter.emit_order_accepted(
+                                &order,
+                                VenueOrderId::new(venue_order.id.as_str()),
+                                clock.get_time_ns(),
+                            );
+                        }
+                        Ok(venue_order) => {
+                            log::error!(
+                                "Alpaca recovery query for {client_order_id} returned mismatched order {} with client ID {}; keeping submission unresolved after: {submit_error}",
+                                venue_order.id, venue_order.client_order_id,
+                            );
+                        }
+                        Err(query_error) => {
+                            if submit_error.is_definitive_submission_rejection() {
+                                emitter.emit_order_rejected(
+                                    &order,
+                                    &submit_error.to_string(),
+                                    clock.get_time_ns(),
+                                    false,
+                                );
+                            } else {
+                                // Leave the order submitted. Startup/periodic reconciliation can
+                                // still discover it; rejecting here could let the strategy place a
+                                // duplicate while the first order is live.
+                                log::error!(
+                                    "Alpaca order {client_order_id} has an ambiguous submission result: {submit_error}; recovery query failed: {query_error}",
+                                );
+                            }
+                        }
+                    }
                 }
             }
         });
