@@ -205,6 +205,16 @@ pub struct AlpacaExecClientConfig {
     /// When set, connection fails unless the authenticated account matches exactly. This prevents
     /// credentials for another Paper or Live account from silently passing startup checks.
     pub expected_account_number: Option<String>,
+    /// Maximum permitted loss in USD from Alpaca's previous-close equity.
+    ///
+    /// When set, a breached limit denies every order except an exact position close. This is a
+    /// submission boundary rather than an account-wide liquidation coordinator.
+    pub max_daily_loss_usd: Option<rust_decimal::Decimal>,
+    /// Maximum permitted percentage loss from Alpaca's previous-close equity.
+    ///
+    /// The value is a percentage, so `5` means five percent. Either configured daily-loss limit
+    /// can trip the submission boundary.
+    pub max_daily_loss_pct: Option<rust_decimal::Decimal>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
@@ -278,6 +288,8 @@ mod tests {
         assert_eq!(config.environment, AlpacaEnvironment::Paper);
         assert_eq!(config.rest_url(), REST_URL_PAPER);
         assert_eq!(config.ws_url(), WS_TRADING_URL_PAPER);
+        assert!(config.max_daily_loss_usd.is_none());
+        assert!(config.max_daily_loss_pct.is_none());
     }
 
     #[rstest]

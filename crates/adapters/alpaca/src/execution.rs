@@ -59,6 +59,7 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
+use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -72,7 +73,7 @@ use crate::{
     config::AlpacaExecClientConfig,
     http::{
         client::AlpacaRawHttpClient,
-        models::AlpacaOrder,
+        models::{Account, AlpacaOrder, AlpacaPosition},
         parse_exec::{
             parse_decimal, parse_fill_activity_report, parse_fill_report,
             parse_order_status_report, parse_position_status_report,
@@ -155,6 +156,14 @@ impl AlpacaExecutionClient {
     ///
     /// Returns an error if the HTTP client cannot be created.
     pub fn new(core: ExecutionClientCore, config: AlpacaExecClientConfig) -> anyhow::Result<Self> {
+        for (name, limit) in [
+            ("max_daily_loss_usd", config.max_daily_loss_usd),
+            ("max_daily_loss_pct", config.max_daily_loss_pct),
+        ] {
+            if limit.is_some_and(|value| value <= Decimal::ZERO) {
+                anyhow::bail!("Alpaca {name} must be positive when configured");
+            }
+        }
         let credential =
             AlpacaCredential::resolve(config.api_key.as_deref(), config.api_secret.as_deref());
 
@@ -308,7 +317,7 @@ impl AlpacaExecutionClient {
 
     /// Validates venue account identity and order eligibility before connection succeeds.
     fn validate_account(
-        account: &crate::http::models::Account,
+        account: &Account,
         expected_account_number: Option<&str>,
     ) -> anyhow::Result<()> {
         if account.status != "ACTIVE" {
@@ -341,6 +350,63 @@ impl AlpacaExecutionClient {
             );
         }
         Ok(())
+    }
+
+    /// Returns a reason when the venue account has crossed either configured previous-close loss
+    /// limit. Invalid venue amounts are errors so an unreadable risk fact cannot permit a write.
+    fn daily_loss_breach(
+        account: &Account,
+        max_loss_usd: Option<Decimal>,
+        max_loss_pct: Option<Decimal>,
+    ) -> anyhow::Result<Option<String>> {
+        if max_loss_usd.is_none() && max_loss_pct.is_none() {
+            return Ok(None);
+        }
+        let equity = parse_decimal(&account.equity, "equity")?;
+        let last_equity = parse_decimal(&account.last_equity, "last_equity")?;
+        if last_equity <= Decimal::ZERO {
+            anyhow::bail!("Alpaca last_equity must be positive when daily-loss limits are enabled");
+        }
+        let loss = last_equity - equity;
+        if loss <= Decimal::ZERO {
+            return Ok(None);
+        }
+        let loss_pct = loss * Decimal::from(100) / last_equity;
+        let cash_hit = max_loss_usd.is_some_and(|limit| loss >= limit);
+        let pct_hit = max_loss_pct.is_some_and(|limit| loss_pct >= limit);
+        Ok((cash_hit || pct_hit).then(|| {
+            format!(
+                "Alpaca daily loss {loss} USD ({loss_pct}%) crossed configured previous-close limit"
+            )
+        }))
+    }
+
+    /// Returns true only for a whole order which exactly closes the venue's current signed
+    /// position. A partial reduction is deliberately denied after a daily-loss breach because the
+    /// remaining exposure would no longer be governed by the strategy decision which tripped.
+    fn exactly_closes_position(
+        request: &SubmitOrderRequest,
+        positions: &[AlpacaPosition],
+    ) -> anyhow::Result<bool> {
+        let quantity = parse_decimal(&request.qty, "order quantity")?;
+        if quantity <= Decimal::ZERO {
+            anyhow::bail!("order quantity must be positive");
+        }
+        let mut matches = positions
+            .iter()
+            .filter(|position| position.symbol == request.symbol);
+        let Some(position) = matches.next() else {
+            return Ok(false);
+        };
+        if matches.next().is_some() {
+            anyhow::bail!("Alpaca returned multiple positions for {}", request.symbol);
+        }
+        let signed_position = parse_decimal(&position.qty, "position quantity")?;
+        Ok(match request.side {
+            AlpacaOrderSide::Sell => signed_position == quantity,
+            AlpacaOrderSide::Buy => signed_position == -quantity,
+            AlpacaOrderSide::SellShort | AlpacaOrderSide::Unknown => false,
+        })
     }
 
     /// Fetches the account and emits its state.
@@ -589,6 +655,8 @@ impl ExecutionClient for AlpacaExecutionClient {
         let clock = self.clock;
         let client_order_id = cmd.client_order_id;
         let expected_account_number = self.config.expected_account_number.clone();
+        let max_daily_loss_usd = self.config.max_daily_loss_usd;
+        let max_daily_loss_pct = self.config.max_daily_loss_pct;
         nautilus_common::live::runtime::get_runtime().spawn(async move {
             let account = match http_client.get_account().await {
                 Ok(account) => account,
@@ -606,6 +674,53 @@ impl ExecutionClient for AlpacaExecutionClient {
                     &format!("Alpaca account pre-submit check failed: {e}"),
                 );
                 return;
+            }
+            let breach = match Self::daily_loss_breach(
+                &account,
+                max_daily_loss_usd,
+                max_daily_loss_pct,
+            ) {
+                Ok(breach) => breach,
+                Err(e) => {
+                    emitter.emit_order_denied(
+                        &order,
+                        &format!("Alpaca daily-loss pre-submit check failed: {e}"),
+                    );
+                    return;
+                }
+            };
+            if let Some(reason) = breach {
+                let positions = match http_client.list_positions().await {
+                    Ok(positions) => positions,
+                    Err(e) => {
+                        emitter.emit_order_denied(
+                            &order,
+                            &format!(
+                                "Alpaca daily-loss close check could not read positions: {e}"
+                            ),
+                        );
+                        return;
+                    }
+                };
+                match Self::exactly_closes_position(&request, &positions) {
+                    Ok(true) => log::warn!(
+                        "{reason}; allowing exact close {} {} {}",
+                        request.side,
+                        request.qty,
+                        request.symbol,
+                    ),
+                    Ok(false) => {
+                        emitter.emit_order_denied(&order, &reason);
+                        return;
+                    }
+                    Err(e) => {
+                        emitter.emit_order_denied(
+                            &order,
+                            &format!("Alpaca daily-loss close check failed: {e}"),
+                        );
+                        return;
+                    }
+                }
             }
 
             emitter.emit_order_submitted(&order);
@@ -1011,6 +1126,7 @@ impl AlpacaExecutionClient {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -1031,6 +1147,31 @@ mod tests {
                 "buying_power": "10000"
             }"#,
         )
+        .unwrap()
+    }
+
+    fn request(side: AlpacaOrderSide, quantity: &str) -> SubmitOrderRequest {
+        SubmitOrderRequest {
+            symbol: "AAPL".to_string(),
+            qty: quantity.to_string(),
+            side,
+            order_type: AlpacaOrderType::Limit,
+            time_in_force: AlpacaTimeInForce::Day,
+            client_order_id: Some("daily-loss-test".to_string()),
+            limit_price: Some("100.00".to_string()),
+            stop_price: None,
+            extended_hours: true,
+        }
+    }
+
+    fn position(quantity: &str, side: &str) -> AlpacaPosition {
+        serde_json::from_value(serde_json::json!({
+            "asset_id": "aapl-id",
+            "symbol": "AAPL",
+            "qty": quantity,
+            "avg_entry_price": "100.00",
+            "side": side
+        }))
         .unwrap()
     }
 
@@ -1062,6 +1203,72 @@ mod tests {
     fn test_unexpected_account_number_fails_preflight() {
         assert!(
             AlpacaExecutionClient::validate_account(&active_account(), Some("LIVE456")).is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_daily_loss_uses_previous_close_and_either_limit() {
+        let mut account = active_account();
+        account.equity = "9400".to_string();
+
+        let cash =
+            AlpacaExecutionClient::daily_loss_breach(&account, Some(dec!(500)), Some(dec!(10)))
+                .unwrap();
+        let percent =
+            AlpacaExecutionClient::daily_loss_breach(&account, Some(dec!(1000)), Some(dec!(5)))
+                .unwrap();
+        let below =
+            AlpacaExecutionClient::daily_loss_breach(&account, Some(dec!(1000)), Some(dec!(10)))
+                .unwrap();
+
+        assert!(cash.is_some());
+        assert!(percent.is_some());
+        assert!(below.is_none());
+    }
+
+    #[rstest]
+    fn test_daily_loss_with_invalid_previous_close_fails_closed() {
+        let mut account = active_account();
+        account.last_equity = "0".to_string();
+
+        assert!(AlpacaExecutionClient::daily_loss_breach(&account, Some(dec!(500)), None).is_err());
+    }
+
+    #[rstest]
+    #[case(AlpacaOrderSide::Sell, "2", "2", "long")]
+    #[case(AlpacaOrderSide::Buy, "2", "-2", "short")]
+    fn test_daily_loss_gate_allows_exact_long_or_short_close(
+        #[case] side: AlpacaOrderSide,
+        #[case] order_quantity: &str,
+        #[case] position_quantity: &str,
+        #[case] position_side: &str,
+    ) {
+        assert!(
+            AlpacaExecutionClient::exactly_closes_position(
+                &request(side, order_quantity),
+                &[position(position_quantity, position_side)],
+            )
+            .unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case(AlpacaOrderSide::Buy, "2", "2", "long")]
+    #[case(AlpacaOrderSide::Sell, "2", "-2", "short")]
+    #[case(AlpacaOrderSide::Sell, "1", "2", "long")]
+    #[case(AlpacaOrderSide::Sell, "3", "2", "long")]
+    fn test_daily_loss_gate_denies_new_risk_partial_reductions_and_oversells(
+        #[case] side: AlpacaOrderSide,
+        #[case] order_quantity: &str,
+        #[case] position_quantity: &str,
+        #[case] position_side: &str,
+    ) {
+        assert!(
+            !AlpacaExecutionClient::exactly_closes_position(
+                &request(side, order_quantity),
+                &[position(position_quantity, position_side)],
+            )
+            .unwrap()
         );
     }
 
