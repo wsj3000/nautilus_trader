@@ -19,6 +19,8 @@
 //! them into `Decimal` or the Nautilus value types happens at the conversion boundary so no
 //! precision is lost to an intermediate float.
 
+use anyhow::Context;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::common::order_enums::{
@@ -496,11 +498,115 @@ pub struct Account {
     pub daytrade_count: Option<u32>,
 }
 
+/// A previous-close equity loss which crossed a configured account limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DailyLossBreach {
+    /// Absolute loss from the previous close, in USD.
+    pub loss_usd: Decimal,
+    /// Loss as a percentage of previous-close equity.
+    pub loss_pct: Decimal,
+}
+
+impl std::fmt::Display for DailyLossBreach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Alpaca daily loss {} USD ({}%) crossed configured previous-close limit",
+            self.loss_usd, self.loss_pct,
+        )
+    }
+}
+
 impl Account {
     /// Returns true when the venue reports any block that prevents order submission.
     #[must_use]
     pub const fn is_blocked(&self) -> bool {
         self.trading_blocked || self.account_blocked
+    }
+
+    /// Validates the venue facts required before trading this account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the account is inactive, blocked, non-USD, or does not match the
+    /// configured account number.
+    pub fn validate_for_trading(
+        &self,
+        expected_account_number: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if self.status != "ACTIVE" {
+            anyhow::bail!(
+                "Alpaca account {} has status {}; expected ACTIVE",
+                self.account_number,
+                self.status,
+            );
+        }
+        if self.is_blocked() {
+            anyhow::bail!(
+                "Alpaca account {} is blocked from trading",
+                self.account_number,
+            );
+        }
+        if self.currency != "USD" {
+            anyhow::bail!(
+                "Alpaca account {} uses {}; expected USD",
+                self.account_number,
+                self.currency,
+            );
+        }
+        if let Some(expected) = expected_account_number
+            && self.account_number != expected
+        {
+            anyhow::bail!(
+                "Authenticated Alpaca account number {} does not match expected {}",
+                self.account_number,
+                expected,
+            );
+        }
+        Ok(())
+    }
+
+    /// Evaluates absolute and percentage loss from the venue's previous-close equity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured limit is non-positive, an equity amount is not a
+    /// decimal, or previous-close equity is not positive.
+    pub fn daily_loss_breach(
+        &self,
+        max_loss_usd: Option<Decimal>,
+        max_loss_pct: Option<Decimal>,
+    ) -> anyhow::Result<Option<DailyLossBreach>> {
+        if max_loss_usd.is_none() && max_loss_pct.is_none() {
+            return Ok(None);
+        }
+        for (name, limit) in [
+            ("maximum daily loss USD", max_loss_usd),
+            ("maximum daily loss percent", max_loss_pct),
+        ] {
+            if limit.is_some_and(|value| value <= Decimal::ZERO) {
+                anyhow::bail!("{name} must be positive");
+            }
+        }
+        let equity = self
+            .equity
+            .parse::<Decimal>()
+            .with_context(|| format!("Invalid equity: {}", self.equity))?;
+        let last_equity = self
+            .last_equity
+            .parse::<Decimal>()
+            .with_context(|| format!("Invalid last_equity: {}", self.last_equity))?;
+        if last_equity <= Decimal::ZERO {
+            anyhow::bail!("Alpaca last_equity must be positive when daily-loss limits are enabled");
+        }
+        let loss_usd = last_equity - equity;
+        if loss_usd <= Decimal::ZERO {
+            return Ok(None);
+        }
+        let loss_pct = loss_usd * Decimal::from(100) / last_equity;
+        let cash_hit = max_loss_usd.is_some_and(|limit| loss_usd >= limit);
+        let pct_hit = max_loss_pct.is_some_and(|limit| loss_pct >= limit);
+        Ok((cash_hit || pct_hit).then_some(DailyLossBreach { loss_usd, loss_pct }))
     }
 }
 

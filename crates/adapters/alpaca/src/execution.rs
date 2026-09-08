@@ -73,7 +73,7 @@ use crate::{
     config::AlpacaExecClientConfig,
     http::{
         client::AlpacaRawHttpClient,
-        models::{Account, AlpacaOrder, AlpacaPosition},
+        models::{AlpacaOrder, AlpacaPosition},
         parse_exec::{
             parse_decimal, parse_fill_activity_report, parse_fill_report,
             parse_order_status_report, parse_position_status_report,
@@ -315,72 +315,6 @@ impl AlpacaExecutionClient {
         )])
     }
 
-    /// Validates venue account identity and order eligibility before connection succeeds.
-    fn validate_account(
-        account: &Account,
-        expected_account_number: Option<&str>,
-    ) -> anyhow::Result<()> {
-        if account.status != "ACTIVE" {
-            anyhow::bail!(
-                "Alpaca account {} has status {}; expected ACTIVE",
-                account.account_number,
-                account.status,
-            );
-        }
-        if account.is_blocked() {
-            anyhow::bail!(
-                "Alpaca account {} is blocked from trading",
-                account.account_number,
-            );
-        }
-        if account.currency != "USD" {
-            anyhow::bail!(
-                "Alpaca account {} uses {}; expected USD",
-                account.account_number,
-                account.currency,
-            );
-        }
-        if let Some(expected) = expected_account_number
-            && account.account_number != expected
-        {
-            anyhow::bail!(
-                "Authenticated Alpaca account number {} does not match expected {}",
-                account.account_number,
-                expected,
-            );
-        }
-        Ok(())
-    }
-
-    /// Returns a reason when the venue account has crossed either configured previous-close loss
-    /// limit. Invalid venue amounts are errors so an unreadable risk fact cannot permit a write.
-    fn daily_loss_breach(
-        account: &Account,
-        max_loss_usd: Option<Decimal>,
-        max_loss_pct: Option<Decimal>,
-    ) -> anyhow::Result<Option<String>> {
-        if max_loss_usd.is_none() && max_loss_pct.is_none() {
-            return Ok(None);
-        }
-        let equity = parse_decimal(&account.equity, "equity")?;
-        let last_equity = parse_decimal(&account.last_equity, "last_equity")?;
-        if last_equity <= Decimal::ZERO {
-            anyhow::bail!("Alpaca last_equity must be positive when daily-loss limits are enabled");
-        }
-        let loss = last_equity - equity;
-        if loss <= Decimal::ZERO {
-            return Ok(None);
-        }
-        let loss_pct = loss * Decimal::from(100) / last_equity;
-        let cash_hit = max_loss_usd.is_some_and(|limit| loss >= limit);
-        let pct_hit = max_loss_pct.is_some_and(|limit| loss_pct >= limit);
-        Ok((cash_hit || pct_hit).then(|| {
-            format!(
-                "Alpaca daily loss {loss} USD ({loss_pct}%) crossed configured previous-close limit"
-            )
-        }))
-    }
-
     /// Returns true only for a whole order which exactly closes the venue's current signed
     /// position. A partial reduction is deliberately denied after a daily-loss breach because the
     /// remaining exposure would no longer be governed by the strategy decision which tripped.
@@ -412,7 +346,7 @@ impl AlpacaExecutionClient {
     /// Fetches the account and emits its state.
     async fn refresh_account(&self) -> anyhow::Result<()> {
         let account = self.http_client.get_account().await?;
-        Self::validate_account(&account, self.config.expected_account_number.as_deref())?;
+        account.validate_for_trading(self.config.expected_account_number.as_deref())?;
 
         let balances = Self::account_balances(&account)?;
         self.emitter.emit_account_state(
@@ -668,15 +602,14 @@ impl ExecutionClient for AlpacaExecutionClient {
                     return;
                 }
             };
-            if let Err(e) = Self::validate_account(&account, expected_account_number.as_deref()) {
+            if let Err(e) = account.validate_for_trading(expected_account_number.as_deref()) {
                 emitter.emit_order_denied(
                     &order,
                     &format!("Alpaca account pre-submit check failed: {e}"),
                 );
                 return;
             }
-            let breach = match Self::daily_loss_breach(
-                &account,
+            let breach = match account.daily_loss_breach(
                 max_daily_loss_usd,
                 max_daily_loss_pct,
             ) {
@@ -689,7 +622,8 @@ impl ExecutionClient for AlpacaExecutionClient {
                     return;
                 }
             };
-            if let Some(reason) = breach {
+            if let Some(breach) = breach {
+                let reason = breach.to_string();
                 let positions = match http_client.list_positions().await {
                     Ok(positions) => positions,
                     Err(e) => {
@@ -924,8 +858,7 @@ impl ExecutionClient for AlpacaExecutionClient {
         nautilus_common::live::runtime::get_runtime().spawn(async move {
             match http_client.get_account().await {
                 Ok(account) => {
-                    if let Err(e) =
-                        Self::validate_account(&account, expected_account_number.as_deref())
+                    if let Err(e) = account.validate_for_trading(expected_account_number.as_deref())
                     {
                         log::error!("Alpaca account query failed eligibility validation: {e}");
                         return;
@@ -1178,7 +1111,9 @@ mod tests {
     #[rstest]
     fn test_active_unblocked_expected_account_passes_preflight() {
         assert!(
-            AlpacaExecutionClient::validate_account(&active_account(), Some("PAPER123")).is_ok()
+            active_account()
+                .validate_for_trading(Some("PAPER123"))
+                .is_ok()
         );
     }
 
@@ -1196,13 +1131,15 @@ mod tests {
         account.currency = currency.to_string();
         account.trading_blocked = blocked;
 
-        assert!(AlpacaExecutionClient::validate_account(&account, Some("PAPER123")).is_err());
+        assert!(account.validate_for_trading(Some("PAPER123")).is_err());
     }
 
     #[rstest]
     fn test_unexpected_account_number_fails_preflight() {
         assert!(
-            AlpacaExecutionClient::validate_account(&active_account(), Some("LIVE456")).is_err()
+            active_account()
+                .validate_for_trading(Some("LIVE456"))
+                .is_err()
         );
     }
 
@@ -1211,15 +1148,15 @@ mod tests {
         let mut account = active_account();
         account.equity = "9400".to_string();
 
-        let cash =
-            AlpacaExecutionClient::daily_loss_breach(&account, Some(dec!(500)), Some(dec!(10)))
-                .unwrap();
-        let percent =
-            AlpacaExecutionClient::daily_loss_breach(&account, Some(dec!(1000)), Some(dec!(5)))
-                .unwrap();
-        let below =
-            AlpacaExecutionClient::daily_loss_breach(&account, Some(dec!(1000)), Some(dec!(10)))
-                .unwrap();
+        let cash = account
+            .daily_loss_breach(Some(dec!(500)), Some(dec!(10)))
+            .unwrap();
+        let percent = account
+            .daily_loss_breach(Some(dec!(1000)), Some(dec!(5)))
+            .unwrap();
+        let below = account
+            .daily_loss_breach(Some(dec!(1000)), Some(dec!(10)))
+            .unwrap();
 
         assert!(cash.is_some());
         assert!(percent.is_some());
@@ -1231,7 +1168,7 @@ mod tests {
         let mut account = active_account();
         account.last_equity = "0".to_string();
 
-        assert!(AlpacaExecutionClient::daily_loss_breach(&account, Some(dec!(500)), None).is_err());
+        assert!(account.daily_loss_breach(Some(dec!(500)), None).is_err());
     }
 
     #[rstest]
