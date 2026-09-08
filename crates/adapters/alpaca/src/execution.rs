@@ -306,16 +306,47 @@ impl AlpacaExecutionClient {
         )])
     }
 
+    /// Validates venue account identity and order eligibility before connection succeeds.
+    fn validate_account(
+        account: &crate::http::models::Account,
+        expected_account_number: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if account.status != "ACTIVE" {
+            anyhow::bail!(
+                "Alpaca account {} has status {}; expected ACTIVE",
+                account.account_number,
+                account.status,
+            );
+        }
+        if account.is_blocked() {
+            anyhow::bail!(
+                "Alpaca account {} is blocked from trading",
+                account.account_number,
+            );
+        }
+        if account.currency != "USD" {
+            anyhow::bail!(
+                "Alpaca account {} uses {}; expected USD",
+                account.account_number,
+                account.currency,
+            );
+        }
+        if let Some(expected) = expected_account_number
+            && account.account_number != expected
+        {
+            anyhow::bail!(
+                "Authenticated Alpaca account number {} does not match expected {}",
+                account.account_number,
+                expected,
+            );
+        }
+        Ok(())
+    }
+
     /// Fetches the account and emits its state.
     async fn refresh_account(&self) -> anyhow::Result<()> {
         let account = self.http_client.get_account().await?;
-
-        if account.is_blocked() {
-            log::error!(
-                "Alpaca account {} is blocked; orders will be rejected by the venue",
-                account.account_number
-            );
-        }
+        Self::validate_account(&account, self.config.expected_account_number.as_deref())?;
 
         let balances = Self::account_balances(&account)?;
         self.emitter.emit_account_state(
@@ -958,6 +989,53 @@ mod tests {
 
     fn vid(raw: &str) -> VenueOrderId {
         VenueOrderId::new(raw)
+    }
+
+    fn active_account() -> crate::http::models::Account {
+        serde_json::from_str(
+            r#"{
+                "id": "paper-id",
+                "account_number": "PAPER123",
+                "status": "ACTIVE",
+                "currency": "USD",
+                "cash": "10000",
+                "equity": "10000",
+                "last_equity": "10000",
+                "buying_power": "10000"
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    fn test_active_unblocked_expected_account_passes_preflight() {
+        assert!(
+            AlpacaExecutionClient::validate_account(&active_account(), Some("PAPER123")).is_ok()
+        );
+    }
+
+    #[rstest]
+    #[case("CLOSED", "USD", false)]
+    #[case("ACTIVE", "EUR", false)]
+    #[case("ACTIVE", "USD", true)]
+    fn test_ineligible_account_fails_preflight(
+        #[case] status: &str,
+        #[case] currency: &str,
+        #[case] blocked: bool,
+    ) {
+        let mut account = active_account();
+        account.status = status.to_string();
+        account.currency = currency.to_string();
+        account.trading_blocked = blocked;
+
+        assert!(AlpacaExecutionClient::validate_account(&account, Some("PAPER123")).is_err());
+    }
+
+    #[rstest]
+    fn test_unexpected_account_number_fails_preflight() {
+        assert!(
+            AlpacaExecutionClient::validate_account(&active_account(), Some("LIVE456")).is_err()
+        );
     }
 
     #[rstest]

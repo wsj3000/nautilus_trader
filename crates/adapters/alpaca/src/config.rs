@@ -200,6 +200,11 @@ pub struct AlpacaExecClientConfig {
     /// liquidity than the caller may expect, so extended-hours execution is opted into.
     #[builder(default)]
     pub default_extended_hours: bool,
+    /// Expected human-readable Alpaca account number.
+    ///
+    /// When set, connection fails unless the authenticated account matches exactly. This prevents
+    /// credentials for another Paper or Live account from silently passing startup checks.
+    pub expected_account_number: Option<String>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
