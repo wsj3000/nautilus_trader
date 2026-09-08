@@ -150,6 +150,19 @@ pub struct AlpacaExecutionClient {
 }
 
 impl AlpacaExecutionClient {
+    fn conflicting_working_client_order_ids<'a>(
+        current_client_order_id: &str,
+        open_orders: &'a [AlpacaOrder],
+    ) -> Vec<&'a str> {
+        open_orders
+            .iter()
+            .filter(|working| {
+                working.client_order_id != current_client_order_id && !working.status.is_terminal()
+            })
+            .map(|working| working.client_order_id.as_str())
+            .collect()
+    }
+
     /// Creates a new [`AlpacaExecutionClient`].
     ///
     /// # Errors
@@ -591,6 +604,7 @@ impl ExecutionClient for AlpacaExecutionClient {
         let expected_account_number = self.config.expected_account_number.clone();
         let max_daily_loss_usd = self.config.max_daily_loss_usd;
         let max_daily_loss_pct = self.config.max_daily_loss_pct;
+        let reject_conflicting_open_orders = self.config.reject_conflicting_open_orders;
         nautilus_common::live::runtime::get_runtime().spawn(async move {
             let account = match http_client.get_account().await {
                 Ok(account) => account,
@@ -654,6 +668,39 @@ impl ExecutionClient for AlpacaExecutionClient {
                         );
                         return;
                     }
+                }
+            }
+            if reject_conflicting_open_orders {
+                let mut params = ListOrdersParams::open();
+                params.symbols = Some(request.symbol.clone());
+                let open_orders = match http_client
+                    .list_orders_all_pages(&params, MAX_ORDER_PAGES)
+                    .await
+                {
+                    Ok(orders) => orders,
+                    Err(e) => {
+                        emitter.emit_order_denied(
+                            &order,
+                            &format!("Alpaca conflicting-order pre-submit query failed: {e}"),
+                        );
+                        return;
+                    }
+                };
+                let conflicts = Self::conflicting_working_client_order_ids(
+                    client_order_id.as_str(),
+                    &open_orders,
+                );
+                if !conflicts.is_empty() {
+                    emitter.emit_order_denied(
+                        &order,
+                        &format!(
+                            "Alpaca symbol {} has {} conflicting working order(s): {}",
+                            request.symbol,
+                            conflicts.len(),
+                            conflicts.join(",")
+                        ),
+                    );
+                    return;
                 }
             }
 
@@ -1108,6 +1155,18 @@ mod tests {
         .unwrap()
     }
 
+    fn order(client_order_id: &str, status: &str) -> AlpacaOrder {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("venue-{client_order_id}"),
+            "client_order_id": client_order_id,
+            "symbol": "AAPL",
+            "side": "buy",
+            "time_in_force": "day",
+            "status": status
+        }))
+        .unwrap()
+    }
+
     #[rstest]
     fn test_active_unblocked_expected_account_passes_preflight() {
         assert!(
@@ -1206,6 +1265,20 @@ mod tests {
                 &[position(position_quantity, position_side)],
             )
             .unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_conflicting_order_gate_ignores_same_identity_and_terminal_history() {
+        let orders = [
+            order("current", "accepted"),
+            order("manual-working", "new"),
+            order("finished", "filled"),
+        ];
+
+        assert_eq!(
+            AlpacaExecutionClient::conflicting_working_client_order_ids("current", &orders),
+            vec!["manual-working"]
         );
     }
 

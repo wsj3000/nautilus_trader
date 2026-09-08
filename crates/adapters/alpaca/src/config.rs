@@ -200,6 +200,13 @@ pub struct AlpacaExecClientConfig {
     /// liquidity than the caller may expect, so extended-hours execution is opted into.
     #[builder(default)]
     pub default_extended_hours: bool,
+    /// Whether a submission is denied while another working order exists for its symbol.
+    ///
+    /// Defaults to false because multi-order strategies may intentionally work several orders.
+    /// Single-order ownership systems can enable this to fail closed on manual or foreign orders
+    /// which are outside their fencing protocol.
+    #[builder(default)]
+    pub reject_conflicting_open_orders: bool,
     /// Expected human-readable Alpaca account number.
     ///
     /// When set, connection fails unless the authenticated account matches exactly. This prevents
@@ -290,6 +297,7 @@ mod tests {
         assert_eq!(config.ws_url(), WS_TRADING_URL_PAPER);
         assert!(config.max_daily_loss_usd.is_none());
         assert!(config.max_daily_loss_pct.is_none());
+        assert!(!config.reject_conflicting_open_orders);
     }
 
     #[rstest]
