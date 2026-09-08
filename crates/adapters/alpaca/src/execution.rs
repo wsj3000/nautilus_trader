@@ -776,18 +776,23 @@ impl ExecutionClient for AlpacaExecutionClient {
     }
 
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
-        let Some(venue_order_id) = cmd.venue_order_id else {
-            anyhow::bail!("Cannot query {}: no venue order ID", cmd.client_order_id);
-        };
-
         let http_client = self.http_client.clone();
         let chain = self.chain.clone();
         let emitter = self.emitter.clone();
         let account_id = self.core.account_id;
         let clock = self.clock;
         nautilus_common::live::runtime::get_runtime().spawn(async move {
-            let live_id = chain.lock().await.resolve(venue_order_id);
-            match http_client.get_order(live_id.as_str()).await {
+            let client_order_id = cmd.client_order_id;
+            let venue_order_id = cmd.venue_order_id;
+            let result = if let Some(venue_order_id) = venue_order_id {
+                let live_id = chain.lock().await.resolve(venue_order_id);
+                http_client.get_order(live_id.as_str()).await
+            } else {
+                http_client
+                    .get_order_by_client_order_id(client_order_id.as_str())
+                    .await
+            };
+            match result {
                 Ok(venue_order) => {
                     match parse_order_status_report(
                         &venue_order,
@@ -796,10 +801,10 @@ impl ExecutionClient for AlpacaExecutionClient {
                         clock.get_time_ns(),
                     ) {
                         Ok(report) => emitter.send_order_status_report(report),
-                        Err(e) => log::warn!("Cannot report order {live_id}: {e}"),
+                        Err(e) => log::warn!("Cannot report order {client_order_id}: {e}"),
                     }
                 }
-                Err(e) => log::error!("Failed to query order {live_id}: {e}"),
+                Err(e) => log::error!("Failed to query order {client_order_id}: {e}"),
             }
         });
 
@@ -810,11 +815,16 @@ impl ExecutionClient for AlpacaExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let Some(venue_order_id) = cmd.venue_order_id else {
+        let venue_order = if let Some(venue_order_id) = cmd.venue_order_id {
+            let live_id = self.live_venue_order_id(venue_order_id).await;
+            self.http_client.get_order(live_id.as_str()).await?
+        } else if let Some(client_order_id) = cmd.client_order_id {
+            self.http_client
+                .get_order_by_client_order_id(client_order_id.as_str())
+                .await?
+        } else {
             return Ok(None);
         };
-        let live_id = self.live_venue_order_id(venue_order_id).await;
-        let venue_order = self.http_client.get_order(live_id.as_str()).await?;
 
         parse_order_status_report(
             &venue_order,
