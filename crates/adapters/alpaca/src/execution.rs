@@ -59,13 +59,17 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
+use nautilus_network::backoff::ExponentialBackoff;
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        consts::ALPACA_VENUE,
+        consts::{
+            ALPACA_VENUE, RECONNECT_BACKOFF_FACTOR, RECONNECT_BASE_BACKOFF, RECONNECT_JITTER_MS,
+            RECONNECT_MAX_BACKOFF,
+        },
         credential::AlpacaCredential,
         order_enums::{AlpacaOrderSide, AlpacaOrderType, AlpacaTimeInForce},
         reg_nms,
@@ -81,7 +85,7 @@ use crate::{
         query::{ActivitiesParams, ListOrdersParams, ReplaceOrderRequest, SubmitOrderRequest},
     },
     websocket::{
-        client::connect_trading_stream,
+        client::{AlpacaTradingStream, connect_trading_stream},
         messages::{AlpacaTradeEvent, TradeUpdate},
     },
 };
@@ -377,7 +381,7 @@ impl AlpacaExecutionClient {
     /// engine learns about venue-side activity it did not initiate. A `replaced` event records the
     /// new identifier in the chain: the venue may replace an order without the engine asking, and
     /// losing that link would leave later cancels addressing a dead identifier.
-    fn spawn_stream_task(&mut self) -> anyhow::Result<()> {
+    async fn open_trading_stream(&self) -> anyhow::Result<AlpacaTradingStream> {
         let Some(credential) = AlpacaCredential::resolve(
             self.config.api_key.as_deref(),
             self.config.api_secret.as_deref(),
@@ -385,23 +389,40 @@ impl AlpacaExecutionClient {
             anyhow::bail!("Cannot open the Alpaca trading stream without credentials");
         };
 
+        connect_trading_stream(
+            self.config.environment,
+            &credential,
+            self.config.base_url_ws.clone(),
+        )
+        .await
+    }
+
+    fn spawn_stream_task(&mut self, mut stream: AlpacaTradingStream) -> anyhow::Result<()> {
+        let Some(credential) = AlpacaCredential::resolve(
+            self.config.api_key.as_deref(),
+            self.config.api_secret.as_deref(),
+        ) else {
+            anyhow::bail!("Cannot reconnect the Alpaca trading stream without credentials");
+        };
+
         let environment = self.config.environment;
         let url_override = self.config.base_url_ws.clone();
+        let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
         let chain = self.chain.clone();
         let account_id = self.core.account_id;
         let token = self.cancellation_token.clone();
         let clock = self.clock;
+        let mut backoff = ExponentialBackoff::new(
+            RECONNECT_BASE_BACKOFF,
+            RECONNECT_MAX_BACKOFF,
+            RECONNECT_BACKOFF_FACTOR,
+            RECONNECT_JITTER_MS,
+            true,
+        )?;
 
         let handle = nautilus_common::live::runtime::get_runtime().spawn(async move {
-            let mut stream =
-                match connect_trading_stream(environment, &credential, url_override).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        log::error!("Failed to open the Alpaca trading stream: {e}");
-                        return;
-                    }
-                };
+            let mut recovery_start = clock.get_time_ns();
 
             loop {
                 let update = tokio::select! {
@@ -414,26 +435,151 @@ impl AlpacaExecutionClient {
 
                 let Some(update) = update else {
                     log::warn!("Alpaca trading stream closed");
-                    return;
+                    loop {
+                        let delay = backoff.next_duration();
+                        if !delay.is_zero() {
+                            log::warn!(
+                                "Reconnecting the Alpaca trading stream in {} ms",
+                                delay.as_millis(),
+                            );
+                        }
+                        tokio::select! {
+                            () = token.cancelled() => return,
+                            () = tokio::time::sleep(delay) => {}
+                        }
+
+                        let reconnect = tokio::select! {
+                            () = token.cancelled() => return,
+                            result = connect_trading_stream(
+                                environment,
+                                &credential,
+                                url_override.clone(),
+                            ) => result,
+                        };
+                        let candidate = match reconnect {
+                            Ok(candidate) => candidate,
+                            Err(e) => {
+                                log::error!("Failed to reconnect the Alpaca trading stream: {e}");
+                                continue;
+                            }
+                        };
+                        let recovered_at = clock.get_time_ns();
+                        match Self::recover_stream_gap(
+                            &http_client,
+                            &emitter,
+                            account_id,
+                            recovery_start,
+                            recovered_at,
+                            clock.get_time_ns(),
+                        )
+                        .await
+                        {
+                            Ok((orders, fills)) => {
+                                log::warn!(
+                                    "Recovered Alpaca trading stream gap with {orders} order reports and {fills} fill reports",
+                                );
+                                stream = candidate;
+                                recovery_start = recovered_at;
+                                backoff.reset();
+                                break;
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to recover the Alpaca trading stream gap: {e}; reconnecting before retry",
+                                );
+                            }
+                        }
+                    }
+                    continue;
                 };
 
                 let update = match update {
                     Ok(update) => update,
                     Err(e) => {
                         // A frame that claimed to be a trade update but could not be decoded means
-                        // an order event was lost, which is worth an error rather than a debug.
+                        // an order event was lost. Reconcile immediately because a malformed frame
+                        // does not necessarily close an otherwise healthy transport.
                         log::error!("Alpaca trade update could not be decoded: {e}");
+                        let recovered_at = clock.get_time_ns();
+                        match Self::recover_stream_gap(
+                            &http_client,
+                            &emitter,
+                            account_id,
+                            recovery_start,
+                            recovered_at,
+                            clock.get_time_ns(),
+                        )
+                        .await
+                        {
+                            Ok((orders, fills)) => {
+                                log::warn!(
+                                    "Recovered malformed Alpaca trade update with {orders} order reports and {fills} fill reports",
+                                );
+                                recovery_start = recovered_at;
+                            }
+                            Err(recovery_error) => {
+                                log::error!(
+                                    "Failed to recover malformed Alpaca trade update: {recovery_error}",
+                                );
+                            }
+                        }
                         continue;
                     }
                 };
 
                 Self::handle_update(&update, &emitter, &chain, account_id, clock.get_time_ns())
                     .await;
+                recovery_start = clock.get_time_ns();
             }
         });
 
         self.tasks.push(handle);
         Ok(())
+    }
+
+    async fn recover_stream_gap(
+        http_client: &AlpacaRawHttpClient,
+        emitter: &ExecutionEventEmitter,
+        account_id: AccountId,
+        start: UnixNanos,
+        end: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<(usize, usize)> {
+        let orders = http_client
+            .list_orders_all_pages(
+                &ListOrdersParams::all()
+                    .with_window(Some(start.to_rfc3339()), Some(end.to_rfc3339())),
+                MAX_ORDER_PAGES,
+            )
+            .await?;
+        let order_reports = Self::reports_from_orders_at(&orders, account_id, ts_init);
+        let order_count = order_reports.len();
+        for report in order_reports {
+            emitter.send_order_status_report(report);
+        }
+
+        let activities = http_client
+            .list_fill_activities_all_pages(
+                &ActivitiesParams::fills()
+                    .with_window(Some(start.to_rfc3339()), Some(end.to_rfc3339())),
+                MAX_ACTIVITY_PAGES,
+            )
+            .await?;
+        let fill_reports = activities
+            .iter()
+            .filter_map(|activity| {
+                parse_fill_activity_report(activity, account_id, reg_nms::PRICE_PRECISION, ts_init)
+                    .inspect_err(|e| {
+                        log::warn!("Skipping Alpaca fill activity {}: {e}", activity.id);
+                    })
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        let fill_count = fill_reports.len();
+        for report in fill_reports {
+            emitter.send_fill_report(report);
+        }
+        Ok((order_count, fill_count))
     }
 
     /// Publishes one trade update.
@@ -569,7 +715,8 @@ impl ExecutionClient for AlpacaExecutionClient {
             return Ok(());
         }
         self.refresh_account().await?;
-        self.spawn_stream_task()?;
+        let stream = self.open_trading_stream().await?;
+        self.spawn_stream_task(stream)?;
         self.core.set_connected();
         Ok(())
     }
@@ -1085,19 +1232,21 @@ impl AlpacaExecutionClient {
     /// Orders that were superseded by a replacement are dropped rather than reported: they are not
     /// cancelled, and the replacement carries the live state.
     fn reports_from_orders(&self, orders: &[AlpacaOrder]) -> Vec<OrderStatusReport> {
-        let ts_init = self.clock.get_time_ns();
+        Self::reports_from_orders_at(orders, self.core.account_id, self.clock.get_time_ns())
+    }
+
+    fn reports_from_orders_at(
+        orders: &[AlpacaOrder],
+        account_id: AccountId,
+        ts_init: UnixNanos,
+    ) -> Vec<OrderStatusReport> {
         orders
             .iter()
             .filter(|order| !order.status.is_superseded())
             .filter_map(|order| {
-                parse_order_status_report(
-                    order,
-                    self.core.account_id,
-                    reg_nms::PRICE_PRECISION,
-                    ts_init,
-                )
-                .inspect_err(|e| log::warn!("Skipping Alpaca order {}: {e}", order.id))
-                .ok()
+                parse_order_status_report(order, account_id, reg_nms::PRICE_PRECISION, ts_init)
+                    .inspect_err(|e| log::warn!("Skipping Alpaca order {}: {e}", order.id))
+                    .ok()
             })
             .collect()
     }
