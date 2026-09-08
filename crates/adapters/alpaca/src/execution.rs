@@ -57,7 +57,7 @@ use nautilus_model::{
     enums::{OmsType, OrderType},
     identifiers::{AccountId, ClientId, VenueOrderId},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, MarginBalance, Money},
+    types::{AccountBalance, Currency, MarginBalance},
 };
 use nautilus_network::backoff::ExponentialBackoff;
 use rust_decimal::Decimal;
@@ -307,29 +307,15 @@ impl AlpacaExecutionClient {
 
         let total = parse_decimal(&account.equity, "equity")?;
         let free = parse_decimal(&account.cash, "cash")?;
-        // The venue reports equity and cash rather than a locked figure, so the difference stands
-        // in for capital committed to positions and working orders.
-        let locked = (total - free).max(rust_decimal::Decimal::ZERO);
+        // Long holdings normally make cash lower than equity, while short-sale proceeds can make
+        // it higher. AccountBalance requires total == locked + free and cannot represent a
+        // negative locked amount. Build it through the checked fixed-point constructor, which
+        // clamps reported cash to equity in that short-account case instead of panicking inside an
+        // event-loop callback. Signed positions remain the source of exposure truth.
+        let balance = AccountBalance::from_total_and_free(total, free, currency)
+            .map_err(|error| anyhow!("Invalid Alpaca account balance: {error}"))?;
 
-        Ok(vec![AccountBalance::new(
-            Money::new(
-                total
-                    .try_into()
-                    .map_err(|_| anyhow!("Equity out of range: {total}"))?,
-                currency,
-            ),
-            Money::new(
-                locked
-                    .try_into()
-                    .map_err(|_| anyhow!("Locked balance out of range: {locked}"))?,
-                currency,
-            ),
-            Money::new(
-                free.try_into()
-                    .map_err(|_| anyhow!("Cash out of range: {free}"))?,
-                currency,
-            ),
-        )])
+        Ok(vec![balance])
     }
 
     /// Returns true only for a whole order which exactly closes the venue's current signed
@@ -1348,6 +1334,34 @@ mod tests {
             active_account()
                 .validate_for_trading(Some("LIVE456"))
                 .is_err()
+        );
+    }
+
+    #[rstest]
+    #[case("100000", "99800", "100000.00", "200.00", "99800.00")]
+    #[case("100000", "100100", "100000.00", "0.00", "100000.00")]
+    fn test_account_balances_preserve_the_invariant_for_long_and_short_cash(
+        #[case] equity: &str,
+        #[case] cash: &str,
+        #[case] total: &str,
+        #[case] locked: &str,
+        #[case] free: &str,
+    ) {
+        let mut account = active_account();
+        account.equity = equity.to_string();
+        account.cash = cash.to_string();
+
+        let balance = AlpacaExecutionClient::account_balances(&account)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(balance.total.to_string(), format!("{total} USD"));
+        assert_eq!(balance.locked.to_string(), format!("{locked} USD"));
+        assert_eq!(balance.free.to_string(), format!("{free} USD"));
+        assert_eq!(
+            balance.locked.checked_add(balance.free),
+            Some(balance.total)
         );
     }
 
