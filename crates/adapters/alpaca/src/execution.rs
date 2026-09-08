@@ -584,13 +584,31 @@ impl ExecutionClient for AlpacaExecutionClient {
             }
         };
 
-        self.emitter.emit_order_submitted(&order);
-
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let client_order_id = cmd.client_order_id;
+        let expected_account_number = self.config.expected_account_number.clone();
         nautilus_common::live::runtime::get_runtime().spawn(async move {
+            let account = match http_client.get_account().await {
+                Ok(account) => account,
+                Err(e) => {
+                    emitter.emit_order_denied(
+                        &order,
+                        &format!("Alpaca account pre-submit query failed: {e}"),
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = Self::validate_account(&account, expected_account_number.as_deref()) {
+                emitter.emit_order_denied(
+                    &order,
+                    &format!("Alpaca account pre-submit check failed: {e}"),
+                );
+                return;
+            }
+
+            emitter.emit_order_submitted(&order);
             match http_client.submit_order(&request).await {
                 Ok(venue_order) => {
                     log::debug!(
@@ -787,19 +805,28 @@ impl ExecutionClient for AlpacaExecutionClient {
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let expected_account_number = self.config.expected_account_number.clone();
         nautilus_common::live::runtime::get_runtime().spawn(async move {
             match http_client.get_account().await {
-                Ok(account) => match Self::account_balances(&account) {
-                    Ok(balances) => {
-                        emitter.emit_account_state(
-                            balances,
-                            Vec::<MarginBalance>::new(),
-                            true,
-                            clock.get_time_ns(),
-                        );
+                Ok(account) => {
+                    if let Err(e) =
+                        Self::validate_account(&account, expected_account_number.as_deref())
+                    {
+                        log::error!("Alpaca account query failed eligibility validation: {e}");
+                        return;
                     }
-                    Err(e) => log::error!("Failed to convert Alpaca account: {e}"),
-                },
+                    match Self::account_balances(&account) {
+                        Ok(balances) => {
+                            emitter.emit_account_state(
+                                balances,
+                                Vec::<MarginBalance>::new(),
+                                true,
+                                clock.get_time_ns(),
+                            );
+                        }
+                        Err(e) => log::error!("Failed to convert Alpaca account: {e}"),
+                    }
+                }
                 Err(e) => log::error!("Failed to query Alpaca account: {e}"),
             }
         });
